@@ -7,6 +7,7 @@ import (
 	"image/png"
 
 	"github.com/egoist/mygo/ui"
+	"golang.org/x/image/draw"
 )
 
 // The look of Windows 11 (Fluent): its neutral colors, light and dark, on
@@ -108,38 +109,20 @@ func glyph(c *ui.Context, g rune) ui.Element {
 	return ui.Text(c, string(g)).Font(iconFont).FontSize(16).SingleLine().Shrink(0).Role(ui.RoleNone)
 }
 
-//go:embed resources/icon.png
+//go:embed resources/titlebar.png
 var iconPNG []byte
 
-// logo is the app's icon at px pixels, scaled down from the 1024 of
-// icon.png with a box filter, which keeps it sharp where the GPU would not.
+// logo scales the pre-sized title-bar asset for the display's DPI. The original
+// 1024px branding asset is used at generation time, never during app startup.
 func logo(px int) *ui.Bitmap {
-	src, err := png.Decode(bytes.NewReader(iconPNG))
-	if err != nil || px <= 0 {
+	if px <= 0 {
 		return nil
 	}
-	b := src.Bounds()
-	dst := image.NewNRGBA(image.Rect(0, 0, px, px))
-	for y := range px {
-		y0, y1 := b.Min.Y+y*b.Dy()/px, b.Min.Y+(y+1)*b.Dy()/px
-		for x := range px {
-			x0, x1 := b.Min.X+x*b.Dx()/px, b.Min.X+(x+1)*b.Dx()/px
-			var r, g, bl, a, n uint64
-			for sy := y0; sy < y1; sy++ {
-				for sx := x0; sx < x1; sx++ {
-					cr, cg, cb, ca := src.At(sx, sy).RGBA() // premultiplied
-					r, g, bl, a, n = r+uint64(cr), g+uint64(cg), bl+uint64(cb), a+uint64(ca), n+1
-				}
-			}
-			if a == 0 {
-				continue
-			}
-			i := dst.PixOffset(x, y)
-			dst.Pix[i+0] = uint8(r * 255 / a)
-			dst.Pix[i+1] = uint8(g * 255 / a)
-			dst.Pix[i+2] = uint8(bl * 255 / a)
-			dst.Pix[i+3] = uint8(a / n >> 8)
-		}
+	src, err := png.Decode(bytes.NewReader(iconPNG))
+	if err != nil {
+		return nil
 	}
+	dst := image.NewNRGBA(image.Rect(0, 0, px, px))
+	draw.ApproxBiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), draw.Src, nil)
 	return ui.NewBitmap(dst)
 }

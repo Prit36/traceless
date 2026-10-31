@@ -2,15 +2,19 @@ package main
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+	"golang.org/x/sys/windows"
 )
 
 // phase is where removing an app stands: each shows a dialog.
@@ -92,36 +96,48 @@ type model struct {
 	pal      palette
 	logo     *ui.Bitmap
 
-	apps    []*App // all of them, by name
-	shown   []*App // those the view and the search find, sorted
-	counts  map[string]int
-	totalKB uint64
-	maxKB   uint64 // the largest app shown, the full length of the size bars
-	loading bool
-	nav     string
-	query   string
-	sort    ui.SortOrder
-	list    ui.ListState
-	chosen  int
-	search  ui.Handle
+	apps        []*App // all of them, by name
+	shown       []*App // those the view and the search find, sorted
+	counts      map[string]int
+	totalKB     uint64
+	maxKB       uint64 // the largest app shown, the full length of the size bars
+	loading     bool
+	nav         string
+	query       string
+	sort        ui.SortOrder
+	list        ui.ListState
+	chosen      int
+	search      ui.Handle
+	indexedApps []*App
+	countsAt    time.Time
 
-	icons   map[string]*ui.Bitmap // by icon path; nil where there is none
-	pending map[string]bool
-	iconReq chan string
-	iconPx  int
+	icons      map[string]*ui.Bitmap // by icon path; nil where there is none
+	iconUsed   map[string]uint64
+	iconClock  uint64
+	pending    map[string]bool
+	iconReq    chan string
+	iconPx     int
+	stop       chan struct{}
+	stopOnce   sync.Once
+	reloadID   uint64
+	scanID     uint64
+	scanCancel context.CancelFunc
+	sizing     bool
 
-	phase     phase
-	open      bool
-	target    *App
-	quiet     bool
-	run       *Uninstall
-	runErr    error
-	gone      bool // the app's entry went away as its uninstaller ran
-	leftovers []Leftover
-	rows      []int // the leftovers table's rows: indexes, or a section's header
-	rowList   ui.ListState
-	result    CleanResult
-	toast     string
+	phase                    phase
+	open                     bool
+	target                   *App
+	quiet                    bool
+	run                      *Uninstall
+	runErr                   error
+	gone                     bool // the app's entry went away as its uninstaller ran
+	leftovers                []Leftover
+	rows                     []int // the leftovers table's rows: indexes, or a section's header
+	rowsItems                []Leftover
+	fileCount, registryCount int
+	rowList                  ui.ListState
+	result                   CleanResult
+	toast                    string
 }
 
 // The headers of the leftovers table's sections.
@@ -138,10 +154,12 @@ func newModel(elevated bool) *model {
 		sort:     ui.SortOrder{Column: "Name"},
 		counts:   make(map[string]int),
 		icons:    make(map[string]*ui.Bitmap),
+		iconUsed: make(map[string]uint64),
 		pending:  make(map[string]bool),
-		iconReq:  make(chan string, 256),
+		iconReq:  make(chan string, 32),
 		iconPx:   largeIcon,
-		logo:     logo(32),
+		logo:     logo(16),
+		stop:     make(chan struct{}),
 	}
 }
 
@@ -152,16 +170,24 @@ func (m *model) start() {
 		scale = max(scale, d.ScaleFactor)
 	}
 	m.iconPx = int(largeIcon*scale + 0.5)
-	m.logo = logo(int(16*scale + 0.5))
+	if scale != 1 {
+		m.logo = logo(int(16*scale + 0.5))
+	}
+	m.win.OnClosed(m.shutdown)
 	go m.iconWorker()
 	m.reload()
 }
 
 func (m *model) reload() {
+	m.reloadID++
+	id := m.reloadID
 	m.loading = true
 	go func() {
 		apps := LoadApps()
 		m.win.Update(func() {
+			if id != m.reloadID {
+				return
+			}
 			m.apps, m.loading = apps, false
 			m.filter()
 		})
@@ -177,20 +203,29 @@ func (m *model) filter() {
 	}
 	view := navFind(m.nav)
 	q := strings.ToLower(strings.TrimSpace(m.query))
-	clear(m.counts)
-	m.shown, m.totalKB, m.maxKB = m.shown[:0], 0, 0
-	for _, a := range m.apps {
-		for _, n := range navViews {
-			if n.match == nil || n.match(a) {
-				m.counts[n.id]++
+	if !sameApps(m.apps, m.indexedApps) || time.Since(m.countsAt) > time.Minute {
+		clear(m.counts)
+		for _, a := range m.apps {
+			for _, n := range navViews {
+				if n.match == nil || n.match(a) {
+					m.counts[n.id]++
+				}
 			}
 		}
+		m.indexedApps, m.countsAt = m.apps, time.Now()
+	}
+	previous := m.shown
+	m.shown, m.totalKB, m.maxKB = m.shown[:0], 0, 0
+	for _, a := range m.apps {
 		if (view.match == nil || view.match(a)) &&
 			(q == "" || strings.Contains(a.lowerName, q) || strings.Contains(a.lowerPublisher, q)) {
 			m.shown = append(m.shown, a)
 			m.totalKB += a.SizeKB
 			m.maxKB = max(m.maxKB, a.SizeKB)
 		}
+	}
+	if len(previous) > len(m.shown) {
+		clear(previous[len(m.shown):])
 	}
 	var by func(a, b *App) int
 	switch m.sort.Column {
@@ -228,6 +263,10 @@ func (m *model) filter() {
 	}
 }
 
+func sameApps(a, b []*App) bool {
+	return len(a) == len(b) && (len(a) == 0 || &a[0] == &b[0])
+}
+
 func (m *model) selected() *App {
 	if m.chosen < 0 || m.chosen >= len(m.shown) {
 		return nil
@@ -243,6 +282,8 @@ func (m *model) icon(a *App) *ui.Bitmap {
 		return nil
 	}
 	if b, ok := m.icons[p]; ok {
+		m.iconClock++
+		m.iconUsed[p] = m.iconClock
 		return b
 	}
 	if !m.pending[p] {
@@ -256,18 +297,83 @@ func (m *model) icon(a *App) *ui.Bitmap {
 }
 
 func (m *model) iconWorker() {
-	for p := range m.iconReq {
-		var b *ui.Bitmap
-		if _, err := os.Stat(p); err == nil {
-			if data, err := mygo.Shell.FileIcon(p, m.iconPx); err == nil {
-				b, _ = ui.DecodeBitmap(data)
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	err := initIconApartment()
+	if err == nil {
+		defer windows.CoUninitialize()
+	}
+	type loadedIcon struct {
+		path   string
+		bitmap *ui.Bitmap
+	}
+	for {
+		var p string
+		select {
+		case <-m.stop:
+			return
+		case p = <-m.iconReq:
+		}
+		batch := make([]loadedIcon, 0, 8)
+		started := time.Now()
+	loadBatch:
+		for {
+			var b *ui.Bitmap
+			if err == nil {
+				b, _ = loadFileIcon(p, m.iconPx)
+			}
+			batch = append(batch, loadedIcon{p, b})
+			if len(batch) == cap(batch) || time.Since(started) >= 12*time.Millisecond {
+				break
+			}
+			select {
+			case <-m.stop:
+				return
+			case p = <-m.iconReq:
+			default:
+				break loadBatch
 			}
 		}
 		m.win.Update(func() {
-			m.icons[p] = b
-			delete(m.pending, p)
+			for _, icon := range batch {
+				m.cacheIcon(icon.path, icon.bitmap)
+				delete(m.pending, icon.path)
+			}
 		})
 	}
+}
+
+// Bound both bitmap pixels (including high-DPI icons) and failed lookups. The
+// renderer releases textures after their bitmaps are no longer referenced.
+func (m *model) cacheIcon(path string, b *ui.Bitmap) {
+	limit := min(128, max(16, (2<<20)/max(1, m.iconPx*m.iconPx*4)))
+	if _, ok := m.icons[path]; !ok && len(m.icons) >= limit {
+		var oldest string
+		age := ^uint64(0)
+		for p, used := range m.iconUsed {
+			if used < age {
+				oldest, age = p, used
+			}
+		}
+		delete(m.icons, oldest)
+		delete(m.iconUsed, oldest)
+	}
+	m.iconClock++
+	m.icons[path], m.iconUsed[path] = b, m.iconClock
+}
+
+func (m *model) shutdown() {
+	m.stopOnce.Do(func() { close(m.stop) })
+	m.cancelScan()
+}
+
+func (m *model) cancelScan() {
+	m.scanID++
+	if m.scanCancel != nil {
+		m.scanCancel()
+		m.scanCancel = nil
+	}
+	m.sizing = false
 }
 
 func (m *model) view(c *ui.Context) {
@@ -452,7 +558,7 @@ func (m *model) commands(c *ui.Context, t *ui.Theme, compact bool) {
 			} else if command(c, "uninstall", glyphDelete, "Uninstall", "Uninstall (Del)", a == nil) {
 				m.ask(a)
 			}
-			if command(c, "open", glyphOpen, "Open location", "Open the install folder", a == nil || a.Dir == "" || !exists(a.Dir)) {
+			if command(c, "open", glyphOpen, "Open location", "Open the install folder", a == nil || !a.dirExists) {
 				mygo.Shell.OpenPath(a.Dir)
 			}
 		}).Label("Commands").Grow(1).Shrink(1)
@@ -520,7 +626,7 @@ func (m *model) appTable(c *ui.Context, t *ui.Theme) {
 			m.chosen = row
 			m.ask(a)
 		}
-		if menu.Item("Open location").Disabled(a.Dir == "" || !exists(a.Dir)).Chosen() {
+		if menu.Item("Open location").Disabled(!a.dirExists).Chosen() {
 			mygo.Shell.OpenPath(a.Dir)
 		}
 		if menu.Item("Copy name").Chosen() {
@@ -565,7 +671,7 @@ func (m *model) cell(c *ui.Context, t *ui.Theme, row, col int) {
 	case 2:
 		m.sizeCell(c, t, a)
 	case 3:
-		muted(formatDate(a.InstallDate))
+		muted(a.dateText)
 	}
 }
 
@@ -580,7 +686,7 @@ func (m *model) sizeCell(c *ui.Context, t *ui.Theme, a *App) {
 		ui.Box(c).Width(44).Height(4).Radius(2).Shrink(0).Background(m.pal.tag).Children(func() {
 			ui.Box(c).Width(max(2, 44*share)).Height(4).Radius(2).Background(t.Accent.Alpha(0.35 + 0.65*share))
 		})
-		ui.Text(c, formatBytes(int64(a.SizeKB)*1024)).FontSize(12.5).FontFeatures("tnum").SingleLine().
+		ui.Text(c, a.sizeText).FontSize(12.5).FontFeatures("tnum").SingleLine().
 			Grow(1).TextAlign(ui.End)
 	})
 }
@@ -632,7 +738,7 @@ func (m *model) details(c *ui.Context, t *ui.Theme) {
 					ui.Text(c, "·").FontSize(12).TextColor(t.TextMuted)
 					ui.Text(c, "Its uninstaller is missing: only its leftovers can be removed").FontSize(12).
 						TextColor(t.Warning).SingleLine().Shrink(1)
-				case a.Dir != "" && exists(a.Dir):
+				case a.dirExists:
 					ui.Text(c, "·").FontSize(12).TextColor(t.TextMuted)
 					if hyperlink(c, "dir", a.Dir).Tooltip("Open in File Explorer").Shrink(1).Clicked() {
 						mygo.Shell.OpenPath(a.Dir)
@@ -660,6 +766,7 @@ func (m *model) restartElevated(c *ui.Context) {
 
 // ask starts removing an app, asking first.
 func (m *model) ask(a *App) {
+	m.cancelScan()
 	m.target, m.quiet, m.runErr, m.gone, m.leftovers = a, false, nil, false, nil
 	m.result = CleanResult{}
 	m.phase = phaseConfirm
@@ -687,20 +794,72 @@ func (m *model) uninstall() {
 // scan looks for the target's leftovers, with the apps read again: the
 // uninstaller may have taken others with it.
 func (m *model) scan() {
+	m.cancelScan()
+	ctx, cancel := context.WithCancel(context.Background())
+	m.scanCancel = cancel
+	id := m.scanID
+	m.reloadID++ // an older refresh must not replace this scan's app list
 	m.phase = phaseScanning
 	a := m.target
 	go func() {
 		apps := LoadApps()
-		items := NewScanner(a, apps).Scan()
+		if ctx.Err() != nil {
+			return
+		}
+		items := NewScanner(a, apps).Discover(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		// Measurement owns items; the UI owns a separate slice so selection,
+		// dismissal and size updates cannot race with the worker.
+		visible := slices.Clone(items)
 		m.win.Update(func() {
-			m.apps = apps
+			if id != m.scanID || ctx.Err() != nil {
+				return
+			}
+			m.apps, m.loading = apps, false
 			m.filter()
-			m.leftovers, m.phase = items, phaseResults
+			m.leftovers, m.phase, m.sizing = visible, phaseResults, len(items) > 0
+		})
+		var batch []sizeUpdate
+		last := time.Now()
+		publish := func() {
+			if len(batch) == 0 {
+				return
+			}
+			updates := batch
+			batch = nil
+			m.win.Update(func() {
+				if id != m.scanID || ctx.Err() != nil {
+					return
+				}
+				for _, u := range updates {
+					m.leftovers[u.index].Size = u.size
+				}
+			})
+			last = time.Now()
+		}
+		measureContext(ctx, items, func(u sizeUpdate) {
+			batch = append(batch, u)
+			if len(batch) >= 64 || time.Since(last) >= 75*time.Millisecond {
+				publish()
+			}
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		publish()
+		m.win.Update(func() {
+			if id == m.scanID {
+				m.sizing = false
+				m.scanCancel = nil
+			}
 		})
 	}()
 }
 
 func (m *model) clean(items []Leftover, permanent bool) {
+	m.cancelScan()
 	m.phase = phaseCleaning
 	name := m.target.Name
 	before := m.result
@@ -730,6 +889,7 @@ func backupRoot() string {
 
 // close ends the dialogs, and reads the apps again when one may have gone.
 func (m *model) close() {
+	m.cancelScan()
 	if m.phase >= phaseFinished {
 		m.reload()
 	}
@@ -737,6 +897,9 @@ func (m *model) close() {
 		m.toast = fmt.Sprintf("Removed %s of %s", plural(m.result.Removed, "leftover"), m.target.Name)
 	}
 	m.phase, m.run = phaseNone, nil
+	m.target, m.leftovers, m.rowsItems, m.rows = nil, nil, nil, nil
+	m.result = CleanResult{}
+	m.rowList = ui.ListState{}
 }
 
 // dialog shows what removing the target is at, over the window, as
@@ -932,11 +1095,21 @@ func (m *model) busy(c *ui.Context, t *ui.Theme, title, msg string) {
 // leftoverRows lays the leftovers out in the table: files and folders,
 // then the registry, each under its header.
 func (m *model) leftoverRows() {
+	if len(m.rowsItems) == len(m.leftovers) && (len(m.leftovers) == 0 || &m.rowsItems[0] == &m.leftovers[0]) {
+		return
+	}
+	m.rowsItems = m.leftovers
+	m.fileCount, m.registryCount = 0, 0
 	m.rows = m.rows[:0]
 	for _, section := range []int{rowFiles, rowRegistry} {
 		at := len(m.rows)
 		for i, l := range m.leftovers {
 			if l.IsRegistry() == (section == rowRegistry) {
+				if section == rowFiles {
+					m.fileCount++
+				} else {
+					m.registryCount++
+				}
 				if len(m.rows) == at {
 					m.rows = append(m.rows, section)
 				}
@@ -981,6 +1154,9 @@ func (m *model) resultsView(c *ui.Context, t *ui.Theme) {
 		summary := plural(len(items), "item")
 		if size > 0 {
 			summary += " · " + formatBytes(size)
+		}
+		if m.sizing {
+			summary += " · Measuring sizes…"
 		}
 		ui.Text(c, summary).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(0)
 		ui.Box(c).Grow(1)
@@ -1027,7 +1203,7 @@ func (m *model) resultsView(c *ui.Context, t *ui.Theme) {
 		if chosenSize > 0 {
 			label += " (" + formatBytes(chosenSize) + ")"
 		}
-		if ui.PrimaryButton(c.Key("remove"), label).MinWidth(160).Disabled(chosen == 0).Clicked() {
+		if ui.PrimaryButton(c.Key("remove"), label).MinWidth(160).Disabled(chosen == 0 || m.sizing).Clicked() {
 			var picked []Leftover
 			for _, l := range m.leftovers {
 				if l.Selected {
@@ -1063,11 +1239,9 @@ func (m *model) leftoverCell(c *ui.Context, t *ui.Theme, row, col int) {
 		if r == rowRegistry {
 			title, g = "Registry", glyphKey
 		}
-		n := 0
-		for _, l := range m.leftovers {
-			if l.IsRegistry() == (r == rowRegistry) {
-				n++
-			}
+		n := m.fileCount
+		if r == rowRegistry {
+			n = m.registryCount
 		}
 		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
 			glyph(c, g).FontSize(14)
@@ -1246,8 +1420,7 @@ func shortPath(l *Leftover) (name, parent string) {
 	if !l.IsRegistry() {
 		return filepath.Base(l.Path), filepath.Dir(l.Path)
 	}
-	hive := strings.NewReplacer("HKEY_LOCAL_MACHINE", "HKLM", "HKEY_CURRENT_USER", "HKCU",
-		"HKEY_CLASSES_ROOT", "HKCR", "HKEY_USERS", "HKU").Replace(hiveName(l.Hive))
+	hive := shortHiveName(l.Hive)
 	if l.Kind == KindValue {
 		return l.Value, hive + `\` + l.Path
 	}

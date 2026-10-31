@@ -40,6 +40,8 @@ type App struct {
 	Broken bool
 
 	id, lowerName, lowerPublisher string
+	sizeText, dateText            string
+	dirExists                     bool
 }
 
 // ID identifies the app's registry entry.
@@ -128,14 +130,29 @@ func readBranch(hive registry.Key, path string, allUsers, is32 bool) []*App {
 	}
 	defer branch.Close()
 	names, _ := branch.ReadSubKeyNames(-1)
-	apps := make([]*App, 0, len(names))
-	for _, name := range names {
-		if a := readApp(hive, path+`\`+name, name); a != nil {
-			a.AllUsers, a.Is32 = allUsers, is32
-			apps = append(apps, a)
+	apps := make([]*App, len(names))
+	var wg sync.WaitGroup
+	// At most eight registry readers across the four branches. Two per
+	// branch keeps an uneven registry from serializing the entire load.
+	for worker := range min(2, len(names)) {
+		wg.Go(func() {
+			for i := worker; i < len(names); i += 2 {
+				if a := readApp(hive, path+`\`+names[i], names[i]); a != nil {
+					a.AllUsers, a.Is32 = allUsers, is32
+					apps[i] = a
+				}
+			}
+		})
+	}
+	wg.Wait()
+	valid := apps[:0]
+	for _, a := range apps {
+		if a != nil {
+			valid = append(valid, a)
 		}
 	}
-	return apps
+	clear(apps[len(valid):])
+	return valid
 }
 
 var productCodeRe = regexp.MustCompile(`^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$`)
@@ -188,8 +205,11 @@ func readApp(hive registry.Key, path, keyName string) *App {
 // whether its uninstaller is there.
 func (a *App) prepare() {
 	a.Dir = appInstallDir(a)
+	a.dirExists = a.Dir != "" && exists(a.Dir)
 	a.Broken = !(a.ProductCode != "" && (a.MSI || isMsiexec(a.UninstallString))) && !commandExists(a.UninstallString)
 	a.lowerName, a.lowerPublisher = strings.ToLower(a.Name), strings.ToLower(a.Publisher)
+	a.sizeText, a.dateText = formatBytes(int64(a.SizeKB)*1024), formatDate(a.InstallDate)
+	a.ID()
 }
 
 func str(k registry.Key, name string) string {
@@ -341,6 +361,20 @@ func hiveName(k registry.Key) string {
 		return "HKEY_CLASSES_ROOT"
 	case registry.USERS:
 		return "HKEY_USERS"
+	}
+	return "HKEY"
+}
+
+func shortHiveName(k registry.Key) string {
+	switch k {
+	case registry.LOCAL_MACHINE:
+		return "HKLM"
+	case registry.CURRENT_USER:
+		return "HKCU"
+	case registry.CLASSES_ROOT:
+		return "HKCR"
+	case registry.USERS:
+		return "HKU"
 	}
 	return "HKEY"
 }

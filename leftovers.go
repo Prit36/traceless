@@ -2,13 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"unicode"
@@ -82,6 +83,7 @@ type Scanner struct {
 
 	self      string
 	otherDirs []string // where the other apps are installed, lower case
+	ctx       context.Context
 }
 
 // NewScanner prepares a scan of the usual places for app, among all the
@@ -160,6 +162,22 @@ func nonEmpty(paths ...string) []string {
 // Scan looks for the app's leftovers. Folders the scan finds still have
 // their size measured, in parallel.
 func (s *Scanner) Scan() []Leftover {
+	return s.ScanContext(context.Background())
+}
+
+func (s *Scanner) ScanContext(ctx context.Context) []Leftover {
+	items := s.Discover(ctx)
+	measureContext(ctx, items, nil)
+	return items
+}
+
+// Discover returns matches before the potentially expensive size walk. All
+// protection checks finish before any result is offered to the user.
+func (s *Scanner) Discover(ctx context.Context) []Leftover {
+	if ctx.Err() != nil {
+		return nil
+	}
+	s.ctx = ctx
 	t := s.tokens()
 	f := &found{seen: make(map[string]bool)}
 
@@ -167,18 +185,51 @@ func (s *Scanner) Scan() []Leftover {
 		sure := depth(dir) >= 2 || t.names[norm(filepath.Base(dir))]
 		f.add(Leftover{Kind: KindFolder, Path: dir, Reason: "Install folder", Sure: sure})
 	}
+	var jobs []func(*found)
 	for _, dir := range s.Dirs {
-		s.scanDir(dir, t, f, true)
+		jobs = append(jobs, func(f *found) { s.scanDir(dir, t, f, true) })
 	}
 	for _, dir := range s.MaybeDirs {
-		s.scanDir(dir, t, f, false)
+		jobs = append(jobs, func(f *found) { s.scanDir(dir, t, f, false) })
 	}
 	for _, dir := range s.ShortcutDirs {
-		s.scanShortcuts(dir, t, f)
+		jobs = append(jobs, func(f *found) { s.scanShortcuts(dir, t, f) })
 	}
-	s.scanRegistry(t, f)
+	jobs = append(jobs, func(f *found) { s.scanRegistry(t, f) })
+	if len(jobs) <= 2 {
+		for _, job := range jobs {
+			if ctx.Err() == nil {
+				job(f)
+			}
+		}
+	} else {
+		results := make([][]Leftover, len(jobs))
+		var wg sync.WaitGroup
+		for worker := range min(4, len(jobs)) {
+			wg.Go(func() {
+				for i := worker; i < len(jobs) && ctx.Err() == nil; i += min(4, len(jobs)) {
+					local := &found{seen: make(map[string]bool)}
+					jobs[i](local)
+					results[i] = local.items
+				}
+			})
+		}
+		wg.Wait()
+		if ctx.Err() != nil {
+			return nil
+		}
+		// Merge in source order, keeping duplicate handling deterministic.
+		for _, result := range results {
+			for _, l := range result {
+				f.add(l)
+			}
+		}
+	}
 
 	for i := range f.items {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if l := &f.items[i]; l.Kind == KindFolder && l.Sure {
 			if why := s.holdsOthers(l.Path, t); why != "" {
 				l.Sure, l.Reason = false, l.Reason+" — "+why
@@ -187,22 +238,11 @@ func (s *Scanner) Scan() []Leftover {
 	}
 	items := f.items
 	pruneNested(&items)
-	measure(items)
-	slices.SortStableFunc(items, func(a, b Leftover) int {
-		if a.IsRegistry() != b.IsRegistry() {
-			if a.IsRegistry() {
-				return 1
-			}
-			return -1
-		}
-		if a.Sure != b.Sure {
-			if a.Sure {
-				return -1
-			}
-			return 1
-		}
-		return strings.Compare(strings.ToLower(a.Display()), strings.ToLower(b.Display()))
-	})
+	keys := make([]string, len(items))
+	for i := range items {
+		keys[i] = strings.ToLower(items[i].Display())
+	}
+	sort.Stable(leftoverOrder{items, keys})
 	// While the app is installed, as when its uninstaller was canceled,
 	// nothing is chosen for the user.
 	live := s.App.StillInstalled() && !s.App.Broken
@@ -210,6 +250,27 @@ func (s *Scanner) Scan() []Leftover {
 		items[i].Selected = items[i].Sure && !live
 	}
 	return items
+}
+
+type leftoverOrder struct {
+	items []Leftover
+	keys  []string
+}
+
+func (o leftoverOrder) Len() int { return len(o.items) }
+func (o leftoverOrder) Less(i, j int) bool {
+	a, b := &o.items[i], &o.items[j]
+	if a.IsRegistry() != b.IsRegistry() {
+		return !a.IsRegistry()
+	}
+	if a.Sure != b.Sure {
+		return a.Sure
+	}
+	return o.keys[i] < o.keys[j]
+}
+func (o leftoverOrder) Swap(i, j int) {
+	o.items[i], o.items[j] = o.items[j], o.items[i]
+	o.keys[i], o.keys[j] = o.keys[j], o.keys[i]
 }
 
 type found struct {
@@ -235,7 +296,8 @@ type tokens struct {
 	loose      []string        // long names that may appear within others
 	publisher  string
 	installDir string
-	exe        string            // the lower-case file name of the app's program
+	exe        string // the lower-case file name of the app's program
+	shortcut   *shortcutMatcher
 	shared     map[string]string // names other installed apps go by, to their names
 	others     []otherApp
 }
@@ -243,6 +305,7 @@ type tokens struct {
 type otherApp struct{ lower, name string } // its name cleaned in lower case, and as shown
 
 func (s *Scanner) tokens() *tokens {
+	s.otherDirs = s.otherDirs[:0]
 	a := s.App
 	t := &tokens{
 		names:      make(map[string]bool),
@@ -252,6 +315,9 @@ func (s *Scanner) tokens() *tokens {
 		publisher:  norm(cleanPublisher(a.Publisher)),
 		installDir: a.Dir,
 		exe:        mainExe(a),
+	}
+	if t.installDir != "" && depth(t.installDir) >= 2 {
+		t.shortcut = newShortcutMatcher(t.installDir + `\`)
 	}
 	for n := range appNames(a) {
 		t.names[n] = true
@@ -317,9 +383,13 @@ func appNames(a *App) map[string]bool {
 // possibly, and the other app it may also be. inPublisher is set for what
 // is in the publisher's folder or key.
 func (t *tokens) match(name string, inPublisher ...bool) (sure, maybe bool, other string) {
-	n, c := norm(name), norm(cleanName(name))
+	n := norm(name)
 	if len(n) < 3 || protectedNames[n] || genericNames[n] {
 		return false, false, ""
+	}
+	c := n
+	if cleaned := cleanName(name); cleaned != name {
+		c = norm(cleaned)
 	}
 	switch {
 	case t.names[n] || t.names[c]:
@@ -413,11 +483,17 @@ func (s *Scanner) holdsOthers(dir string, t *tokens) string {
 // publisher there: when the app's are all that folder holds, the whole
 // folder goes.
 func (s *Scanner) scanDir(dir string, t *tokens, f *found, canBeSure bool) {
+	if s.cancelled() {
+		return
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
+		if s.cancelled() {
+			return
+		}
 		if !e.IsDir() || e.Type()&fs.ModeSymlink != 0 {
 			continue
 		}
@@ -484,11 +560,20 @@ func reason(why, other string, canBeSure bool) string {
 // scanShortcuts looks for the app's shortcuts and Start menu folders: by
 // their names, or by the install folder they lead into.
 func (s *Scanner) scanShortcuts(dir string, t *tokens, f *found) {
+	if s.cancelled() {
+		return
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
 	for _, e := range entries {
+		if s.cancelled() {
+			return
+		}
+		if e.Type()&fs.ModeSymlink != 0 {
+			continue
+		}
 		full := filepath.Join(dir, e.Name())
 		if e.IsDir() {
 			if sure, maybe, other := t.match(e.Name()); sure || maybe {
@@ -510,6 +595,9 @@ func (s *Scanner) scanShortcuts(dir string, t *tokens, f *found) {
 }
 
 func (s *Scanner) checkShortcut(path string, t *tokens, f *found) {
+	if s.cancelled() {
+		return
+	}
 	ext := strings.ToLower(filepath.Ext(path))
 	if ext != ".lnk" && ext != ".url" {
 		return
@@ -519,7 +607,7 @@ func (s *Scanner) checkShortcut(path string, t *tokens, f *found) {
 		f.add(Leftover{Kind: KindFile, Path: path, Reason: reason("Shortcut named after the app", other, true), Sure: sure})
 		return
 	}
-	if t.installDir != "" && depth(t.installDir) >= 2 && fileMentions(path, t.installDir+`\`) {
+	if t.shortcut != nil && t.shortcut.mentionsFile(path) {
 		f.add(Leftover{Kind: KindFile, Path: path, Reason: "Shortcut into the install folder", Sure: true})
 	}
 }
@@ -527,28 +615,88 @@ func (s *Scanner) checkShortcut(path string, t *tokens, f *found) {
 // fileMentions reports whether a small file, as a shortcut, holds path, in
 // ANSI or UTF-16, ignoring case. Shortcuts keep their target in both.
 func fileMentions(file, path string) bool {
+	return newShortcutMatcher(path).mentionsFile(file)
+}
+
+type shortcutMatcher struct {
+	ansi, wide []byte
+	ascii      bool
+}
+
+var shortcutBuffers = sync.Pool{New: func() any { return new([64 << 10]byte) }}
+
+func newShortcutMatcher(path string) *shortcutMatcher {
+	p := strings.ToLower(path)
+	m := &shortcutMatcher{ansi: []byte(p), ascii: true}
+	for _, r := range p {
+		if r > 127 {
+			m.ascii = false
+			break
+		}
+	}
+	for _, u := range utf16.Encode([]rune(p)) {
+		m.wide = append(m.wide, byte(u), byte(u>>8))
+	}
+	return m
+}
+
+func (m *shortcutMatcher) mentionsFile(file string) bool {
 	fh, err := os.Open(file)
 	if err != nil {
 		return false
 	}
 	defer fh.Close()
-	data, err := io.ReadAll(io.LimitReader(fh, 64<<10))
-	if err != nil {
+	buf := shortcutBuffers.Get().(*[64 << 10]byte)
+	defer shortcutBuffers.Put(buf)
+	n, err := io.ReadFull(fh, buf[:])
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return false
 	}
-	data = bytes.ToLower(data)
-	p := strings.ToLower(path)
-	if bytes.Contains(data, []byte(p)) {
-		return true
+	data := buf[:n]
+	// Check both UTF-16 byte alignments before folding bytes for ANSI.
+	if m.ascii {
+		for i := 0; i+len(m.wide) <= len(data); i++ {
+			match := true
+			for j := 0; j < len(m.wide); j += 2 {
+				c := data[i+j]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				if c != m.wide[j] || data[i+j+1] != 0 {
+					match = false
+					break
+				}
+			}
+			if match {
+				return true
+			}
+		}
+	} else {
+		for offset := range 2 {
+			u := make([]uint16, max(0, (len(data)-offset)/2))
+			for i := range u {
+				u[i] = uint16(data[offset+2*i]) | uint16(data[offset+2*i+1])<<8
+			}
+			if containsFold(string(utf16.Decode(u)), string(m.ansi)) {
+				return true
+			}
+		}
 	}
-	wide := make([]byte, 0, 2*len(p))
-	for _, u := range utf16.Encode([]rune(p)) {
-		wide = append(wide, byte(u), byte(u>>8))
+	if !m.ascii {
+		return bytes.Contains(bytes.ToLower(data), m.ansi)
 	}
-	return bytes.Contains(data, wide)
+	for i, c := range data {
+		if c >= 'A' && c <= 'Z' {
+			data[i] = c + ('a' - 'A')
+		}
+	}
+	return len(m.ansi) > 0 && bytes.Contains(data, m.ansi)
 }
 
 func (s *Scanner) scanRegistry(t *tokens, f *found) {
+	if s.cancelled() {
+		return
+	}
 	a := s.App
 	if a.StillInstalled() {
 		f.add(Leftover{Kind: KindKey, Hive: a.Hive, Path: a.KeyPath, Reason: "The app's entry in the list of installed apps", Sure: a.Broken})
@@ -557,9 +705,16 @@ func (s *Scanner) scanRegistry(t *tokens, f *found) {
 		s.scanKeys(loc, t, f)
 	}
 	dir := t.installDir
-	mentionsDir := func(v string) bool { return dir != "" && depth(dir) >= 2 && containsFold(v, dir+`\`) }
+	prefix := ""
+	if dir != "" && depth(dir) >= 2 {
+		prefix = strings.ToLower(dir + `\`)
+	}
+	mentionsDir := func(v string) bool { return prefix != "" && strings.Contains(strings.ToLower(v), prefix) }
 
 	for _, loc := range s.RunKeys {
+		if s.cancelled() {
+			return
+		}
 		k, err := registry.OpenKey(loc.hive, loc.path, registry.QUERY_VALUE|registry.WOW64_64KEY)
 		if err != nil {
 			continue
@@ -571,9 +726,9 @@ func (s *Scanner) scanRegistry(t *tokens, f *found) {
 				continue
 			}
 			sure, maybe, _ := t.match(name)
-			gone := !commandExists(data)
-			if mentionsDir(data) || (sure && gone) || (maybe && gone) {
-				f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: loc.path, Value: name, Reason: "Starts with Windows", Sure: mentionsDir(data) || sure})
+			inDir := mentionsDir(data)
+			if inDir || ((sure || maybe) && !commandExists(data)) {
+				f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: loc.path, Value: name, Reason: "Starts with Windows", Sure: inDir || sure})
 				approved := `Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run`
 				if hasValue(loc.hive, approved, name) {
 					f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: approved, Value: name, Reason: "Startup setting", Sure: true})
@@ -599,7 +754,7 @@ func (s *Scanner) scanRegistry(t *tokens, f *found) {
 			}
 		}
 	}
-	if dir != "" && depth(dir) >= 2 {
+	if prefix != "" {
 		for _, loc := range s.MuiKeys {
 			k, err := registry.OpenKey(loc.hive, loc.path, registry.QUERY_VALUE)
 			if err != nil {
@@ -608,7 +763,7 @@ func (s *Scanner) scanRegistry(t *tokens, f *found) {
 			names, _ := k.ReadValueNames(-1)
 			k.Close()
 			for _, name := range names {
-				if containsFold(name, dir+`\`) {
+				if mentionsDir(name) {
 					f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: loc.path, Value: name, Reason: "Program name Explorer remembers", Sure: true})
 				}
 			}
@@ -619,6 +774,9 @@ func (s *Scanner) scanRegistry(t *tokens, f *found) {
 // scanKeys looks for the app's keys under loc, as scanDir looks for its
 // folders.
 func (s *Scanner) scanKeys(loc regLoc, t *tokens, f *found) {
+	if s.cancelled() {
+		return
+	}
 	k, err := registry.OpenKey(loc.hive, loc.path, registry.ENUMERATE_SUB_KEYS|registry.WOW64_64KEY)
 	if err != nil {
 		return
@@ -626,6 +784,9 @@ func (s *Scanner) scanKeys(loc regLoc, t *tokens, f *found) {
 	names, _ := k.ReadSubKeyNames(-1)
 	k.Close()
 	for _, name := range names {
+		if s.cancelled() {
+			return
+		}
 		path := loc.path + `\` + name
 		if sure, maybe, other := t.match(name); sure || maybe {
 			f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: path, Reason: reason("Settings key named after the app", other, true), Sure: sure})
@@ -725,21 +886,37 @@ func (s *Scanner) removable(path string) bool {
 // pruneNested drops the leftovers inside a folder or key that goes as a
 // whole, unless they are surer than it is.
 func pruneNested(items *[]Leftover) {
-	type whole struct {
-		prefix string
-		sure   bool
+	var nFolders, nKeys int
+	for _, l := range *items {
+		if l.Kind == KindFolder {
+			nFolders++
+		}
+		if l.Kind == KindKey {
+			nKeys++
+		}
 	}
-	var folders, keys []whole
+	folders, keys := make(map[string]bool, nFolders), make(map[string]bool, nKeys)
 	for _, l := range *items {
 		switch l.Kind {
 		case KindFolder:
-			folders = append(folders, whole{lowerPath(l.Path) + `\`, l.Sure})
+			p := lowerPath(l.Path)
+			folders[p] = folders[p] || l.Sure
 		case KindKey:
-			keys = append(keys, whole{strings.ToLower(l.Display()) + `\`, l.Sure})
+			p := strings.ToLower(l.Display())
+			keys[p] = keys[p] || l.Sure
 		}
 	}
-	inside := func(p string, sure bool, in []whole) bool {
-		return slices.ContainsFunc(in, func(w whole) bool { return strings.HasPrefix(p, w.prefix) && (w.sure || !sure) })
+	inside := func(p string, sure bool, in map[string]bool) bool {
+		for {
+			i := strings.LastIndexByte(p, '\\')
+			if i < 0 {
+				return false
+			}
+			p = p[:i]
+			if parentSure, ok := in[p]; ok && (parentSure || !sure) {
+				return true
+			}
+		}
 	}
 	*items = slices.DeleteFunc(*items, func(l Leftover) bool {
 		switch l.Kind {
@@ -755,36 +932,14 @@ func pruneNested(items *[]Leftover) {
 // measure sets the size of the files and folders, walking the folders in
 // parallel.
 func measure(items []Leftover) {
-	sem := make(chan struct{}, runtime.NumCPU())
-	var wg sync.WaitGroup
-	for i := range items {
-		if items[i].IsRegistry() {
-			continue
-		}
-		wg.Go(func() {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			items[i].Size = diskSize(items[i].Path)
-		})
-	}
-	wg.Wait()
+	measureContext(context.Background(), items, nil)
 }
 
 func diskSize(path string) int64 {
-	var total int64
-	filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.Type().IsRegular() {
-			if info, err := d.Info(); err == nil {
-				total += info.Size()
-			}
-		}
-		return nil
-	})
-	return total
+	return diskSizeContext(context.Background(), path)
 }
+
+func (s *Scanner) cancelled() bool { return s.ctx != nil && s.ctx.Err() != nil }
 
 // appInstallDir is where an app is installed: its InstallLocation, or the
 // folder of its program or uninstaller.
@@ -792,7 +947,11 @@ func appInstallDir(a *App) string {
 	if a.InstallLocation != "" {
 		return a.InstallLocation
 	}
-	for _, p := range []string{a.DisplayIcon, commandExe(a.UninstallString)} {
+	for i := range 2 {
+		p := a.DisplayIcon
+		if i == 1 {
+			p = commandExe(a.UninstallString)
+		}
 		ext := strings.ToLower(filepath.Ext(p))
 		if p == "" || (ext != ".exe" && ext != ".ico") || !filepath.IsAbs(p) {
 			continue

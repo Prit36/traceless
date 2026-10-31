@@ -26,6 +26,7 @@ func sampleModel() *model {
 	for i, a := range m.apps {
 		a.Hive, a.KeyPath = registry.CURRENT_USER, testKey+`\Uninstall\`+string(rune('a'+i))
 		a.lowerName, a.lowerPublisher = strings.ToLower(a.Name), strings.ToLower(a.Publisher)
+		a.sizeText, a.dateText = formatBytes(int64(a.SizeKB)*1024), formatDate(a.InstallDate)
 	}
 	m.loading = false
 	m.filter()
