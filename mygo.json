@@ -1,7 +1,7 @@
 {
   "name": "Traceless",
   "identifier": "app.traceless.desktop",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Uninstalls Windows apps and the files, folders and registry entries they leave behind",
   "publisher": "Prit36",
   "out": "build"

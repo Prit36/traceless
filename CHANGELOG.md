@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.3 — 2026-10-31
+
+- Find more of what apps leave behind: XDG folders in your home (`.config`, `.cache`,
+  `.local`), Temp folders, updater folders, npm commands and packages, link handlers
+  such as `app://`, notification servers, and the records Windows keeps of programs it ran.
+- Offer an app's installer in Downloads, never selected for you.
+- Scan for leftovers about 3.6 times faster.
+
 ## 0.0.2 — 2026-10-31
 
 - Polish spacing and alignment across the app list, navigation, details and dialogs.
