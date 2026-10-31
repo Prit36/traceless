@@ -12,8 +12,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unicode"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -234,7 +236,7 @@ func (s *Scanner) Discover(ctx context.Context) []Leftover {
 	for _, dir := range s.DownloadDirs {
 		jobs = append(jobs, func(f *found) { s.scanDownloads(dir, t, f) })
 	}
-	jobs = append(jobs, func(f *found) { s.scanRegistry(t, f) })
+	jobs = append(jobs, s.registryJobs(t)...)
 	if len(jobs) <= 2 {
 		for _, job := range jobs {
 			if ctx.Err() == nil {
@@ -242,11 +244,20 @@ func (s *Scanner) Discover(ctx context.Context) []Leftover {
 			}
 		}
 	} else {
+		// The jobs wait on the disk and the registry more than they compute,
+		// so more of them run than there are processors. The registry's go
+		// first: listing Classes is the longest.
 		results := make([][]Leftover, len(jobs))
+		var next atomic.Int32
 		var wg sync.WaitGroup
-		for worker := range min(4, len(jobs)) {
+		for range min(8, len(jobs)) {
 			wg.Go(func() {
-				for i := worker; i < len(jobs) && ctx.Err() == nil; i += min(4, len(jobs)) {
+				for ctx.Err() == nil {
+					n := int(next.Add(1)) - 1
+					if n >= len(jobs) {
+						return
+					}
+					i := len(jobs) - 1 - n
 					local := &found{seen: make(map[string]bool)}
 					jobs[i](local)
 					results[i] = local.items
@@ -331,6 +342,7 @@ type tokens struct {
 	names      map[string]bool // exact names, normalized
 	pubNames   map[string]bool // names sure within the publisher's folder or key only
 	maybe      map[string]bool // names that are likely but not sure
+	wanted     []string        // the names of all three, for couldMatch
 	version    string          // the digits of the app's version, as "3147" of 3.14.7
 	loose      []string        // long names that may appear within others
 	publisher  string
@@ -385,6 +397,11 @@ func (s *Scanner) tokens() *tokens {
 			t.names[stem] = true
 		}
 	}
+	for _, set := range [...]map[string]bool{t.names, t.pubNames, t.maybe} {
+		for n := range set {
+			t.wanted = append(t.wanted, n)
+		}
+	}
 	for _, o := range s.Others {
 		t.others = append(t.others, otherApp{strings.ToLower(cleanName(o.Name)), o.Name})
 		for n := range appNames(o) {
@@ -423,7 +440,7 @@ func appNames(a *App) map[string]bool {
 // is in the publisher's folder or key.
 func (t *tokens) match(name string, inPublisher ...bool) (sure, maybe bool, other string) {
 	n := norm(name)
-	if len(n) < 3 || protectedNames[n] || genericNames[n] {
+	if len(n) < 3 || protectedNames[n] || genericNames[n] || !t.couldMatch(n) {
 		return false, false, ""
 	}
 	c := n
@@ -466,6 +483,31 @@ func (t *tokens) match(name string, inPublisher ...bool) (sure, maybe bool, othe
 		}
 	}
 	return sure, maybe, ""
+}
+
+// couldMatch tells cheaply, before cleanName's regexes, whether a name in
+// norm form may match: cleanName only takes characters out, so a name matches
+// only when one of the app's names is a subsequence of it.
+func (t *tokens) couldMatch(n string) bool {
+	for _, name := range t.wanted {
+		if isSubsequence(name, n) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSubsequence(sub, s string) bool {
+	if len(sub) > len(s) {
+		return false
+	}
+	i := 0
+	for j := 0; i < len(sub) && j < len(s); j++ {
+		if s[j] == sub[i] {
+			i++
+		}
+	}
+	return i == len(sub)
 }
 
 // otherVersion reports whether name says it is of another version than the
@@ -766,16 +808,18 @@ func (m *shortcutMatcher) mentionsFile(file string) bool {
 }
 
 func (s *Scanner) scanRegistry(t *tokens, f *found) {
-	if s.cancelled() {
-		return
+	for _, job := range s.registryJobs(t) {
+		if s.cancelled() {
+			return
+		}
+		job(f)
 	}
+}
+
+// registryJobs are the registry's checks, each on its own so that they run
+// in parallel, in the order their results are merged.
+func (s *Scanner) registryJobs(t *tokens) []func(*found) {
 	a := s.App
-	if a.StillInstalled() {
-		f.add(Leftover{Kind: KindKey, Hive: a.Hive, Path: a.KeyPath, Reason: "The app's entry in the list of installed apps", Sure: a.Broken})
-	}
-	for _, loc := range s.NameKeys {
-		s.scanKeys(loc, t, f)
-	}
 	dir := t.installDir
 	prefix := ""
 	if dir != "" && depth(dir) >= 2 {
@@ -783,72 +827,94 @@ func (s *Scanner) scanRegistry(t *tokens, f *found) {
 	}
 	mentionsDir := func(v string) bool { return prefix != "" && strings.Contains(strings.ToLower(v), prefix) }
 
-	for _, loc := range s.RunKeys {
-		if s.cancelled() {
-			return
-		}
-		k, err := registry.OpenKey(loc.hive, loc.path, registry.QUERY_VALUE|registry.WOW64_64KEY)
-		if err != nil {
-			continue
-		}
-		names, _ := k.ReadValueNames(-1)
-		for _, name := range names {
-			data, _, err := k.GetStringValue(name)
-			if err != nil {
-				continue
-			}
-			sure, maybe, _ := t.match(name)
-			inDir := mentionsDir(data)
-			if inDir || ((sure || maybe) && !commandExists(data)) {
-				f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: loc.path, Value: name, Reason: "Starts with Windows", Sure: inDir || sure})
-				approved := `Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run`
-				if hasValue(loc.hive, approved, name) {
-					f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: approved, Value: name, Reason: "Startup setting", Sure: true})
-				}
-			}
-		}
-		k.Close()
+	var jobs []func(*found)
+	add := func(job func(*found)) { jobs = append(jobs, job) }
+	if a.StillInstalled() {
+		add(func(f *found) {
+			f.add(Leftover{Kind: KindKey, Hive: a.Hive, Path: a.KeyPath, Reason: "The app's entry in the list of installed apps", Sure: a.Broken})
+		})
 	}
+	for _, loc := range s.NameKeys {
+		add(func(f *found) { s.scanKeys(loc, t, f) })
+	}
+	add(func(f *found) {
+		for _, loc := range s.RunKeys {
+			s.scanRun(loc, t, f, mentionsDir)
+		}
+	})
 	for _, loc := range s.AppPathKeys {
-		forSubkeys(loc, func(name string, k registry.Key) {
-			target := iconPath(str(k, ""))
-			if mentionsDir(target) || (t.exe != "" && strings.EqualFold(name, t.exe) && target != "" && !exists(target)) {
-				f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: loc.path + `\` + name, Reason: "Program path", Sure: true})
-			}
+		add(func(f *found) {
+			forSubkeys(loc, func(name string, k registry.Key) {
+				target := iconPath(str(k, ""))
+				if mentionsDir(target) || (t.exe != "" && strings.EqualFold(name, t.exe) && target != "" && !exists(target)) {
+					f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: loc.path + `\` + name, Reason: "Program path", Sure: true})
+				}
+			})
 		})
 	}
 	for _, loc := range s.ClassKeys {
-		s.scanClasses(loc, t, f, mentionsDir)
+		add(func(f *found) { s.scanClasses(loc, t, f, mentionsDir) })
 	}
-	if t.exe != "" {
-		for _, loc := range s.AppKeys {
-			path := loc.path + `\` + t.exe
-			if keyExists(loc.hive, path) {
-				gone := a.DisplayIcon == "" || !exists(a.DisplayIcon)
-				f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: path, Reason: "File associations of the app's program", Sure: gone})
+	add(func(f *found) {
+		if t.exe != "" {
+			for _, loc := range s.AppKeys {
+				path := loc.path + `\` + t.exe
+				if keyExists(loc.hive, path) {
+					gone := a.DisplayIcon == "" || !exists(a.DisplayIcon)
+					f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: path, Reason: "File associations of the app's program", Sure: gone})
+				}
 			}
 		}
-	}
-	// Electron's installers keep the install folder in a key named as the
-	// app's entry in the list of installed apps.
-	if id := filepath.Base(a.KeyPath); len(id) >= 32 && strings.Count(id, "-") >= 4 {
-		for _, loc := range s.NameKeys {
-			if path := loc.path + `\` + id; keyExists(loc.hive, path) {
-				f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: path, Reason: "Installer's record of the app", Sure: true})
+		// Electron's installers keep the install folder in a key named as the
+		// app's entry in the list of installed apps.
+		if id := filepath.Base(a.KeyPath); len(id) >= 32 && strings.Count(id, "-") >= 4 {
+			for _, loc := range s.NameKeys {
+				if path := loc.path + `\` + id; keyExists(loc.hive, path) {
+					f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: path, Reason: "Installer's record of the app", Sure: true})
+				}
 			}
 		}
-	}
+	})
 	for _, loc := range s.UsageKeys {
-		s.scanUsage(loc, t, f, prefix)
+		add(func(f *found) { s.scanUsage(loc, t, f, prefix) })
 	}
 	for _, loc := range s.IDKeys {
-		s.scanIDKeys(loc, t, f)
+		add(func(f *found) { s.scanIDKeys(loc, t, f) })
 	}
 	for _, loc := range s.ServerKeys {
-		s.scanServers(loc, t, f, prefix)
+		add(func(f *found) { s.scanServers(loc, t, f, prefix) })
 	}
 	for _, loc := range s.AudioKeys {
-		s.scanAudio(loc, t, f, prefix)
+		add(func(f *found) { s.scanAudio(loc, t, f, prefix) })
+	}
+	return jobs
+}
+
+// scanRun looks for the app's programs that start with Windows.
+func (s *Scanner) scanRun(loc regLoc, t *tokens, f *found, mentionsDir func(string) bool) {
+	if s.cancelled() {
+		return
+	}
+	k, err := registry.OpenKey(loc.hive, loc.path, registry.QUERY_VALUE|registry.WOW64_64KEY)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+	names, _ := k.ReadValueNames(-1)
+	for _, name := range names {
+		data, _, err := k.GetStringValue(name)
+		if err != nil {
+			continue
+		}
+		sure, maybe, _ := t.match(name)
+		inDir := mentionsDir(data)
+		if inDir || ((sure || maybe) && !commandExists(data)) {
+			f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: loc.path, Value: name, Reason: "Starts with Windows", Sure: inDir || sure})
+			approved := `Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run`
+			if hasValue(loc.hive, approved, name) {
+				f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: approved, Value: name, Reason: "Startup setting", Sure: true})
+			}
+		}
 	}
 }
 
@@ -858,12 +924,10 @@ func (s *Scanner) scanKeys(loc regLoc, t *tokens, f *found) {
 	if s.cancelled() {
 		return
 	}
-	k, err := registry.OpenKey(loc.hive, loc.path, registry.ENUMERATE_SUB_KEYS|registry.WOW64_64KEY)
+	names, err := subkeyNames(loc)
 	if err != nil {
 		return
 	}
-	names, _ := k.ReadSubKeyNames(-1)
-	k.Close()
 	for _, name := range names {
 		if s.cancelled() {
 			return
@@ -911,12 +975,10 @@ func (s *Scanner) scanClasses(loc regLoc, t *tokens, f *found, mentionsDir func(
 	if s.cancelled() {
 		return
 	}
-	k, err := registry.OpenKey(loc.hive, loc.path, registry.ENUMERATE_SUB_KEYS|registry.WOW64_64KEY)
+	names, err := subkeyNames(loc)
 	if err != nil {
 		return
 	}
-	names, _ := k.ReadSubKeyNames(-1)
-	k.Close()
 	for _, name := range names {
 		if s.cancelled() {
 			return
@@ -1011,12 +1073,10 @@ func (s *Scanner) scanIDKeys(loc regLoc, t *tokens, f *found) {
 	if s.cancelled() {
 		return
 	}
-	k, err := registry.OpenKey(loc.hive, loc.path, registry.ENUMERATE_SUB_KEYS|registry.WOW64_64KEY)
+	names, err := subkeyNames(loc)
 	if err != nil {
 		return
 	}
-	names, _ := k.ReadSubKeyNames(-1)
-	k.Close()
 	for _, name := range names {
 		if sure, maybe, other := t.match(strings.TrimPrefix(name, "W~")); sure || maybe {
 			f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: loc.path + `\` + name, Reason: reason("Windows settings of the app", other, true), Sure: sure})
@@ -1104,12 +1164,10 @@ func (s *Scanner) scanDownloads(dir string, t *tokens, f *found) {
 }
 
 func forSubkeys(loc regLoc, fn func(name string, k registry.Key)) {
-	k, err := registry.OpenKey(loc.hive, loc.path, registry.ENUMERATE_SUB_KEYS|registry.WOW64_64KEY)
+	names, err := subkeyNames(loc)
 	if err != nil {
 		return
 	}
-	names, _ := k.ReadSubKeyNames(-1)
-	k.Close()
 	for _, name := range names {
 		sk, err := registry.OpenKey(loc.hive, loc.path+`\`+name, registry.QUERY_VALUE|registry.WOW64_64KEY)
 		if err != nil {
@@ -1118,6 +1176,44 @@ func forSubkeys(loc regLoc, fn func(name string, k registry.Key)) {
 		fn(name, sk)
 		sk.Close()
 	}
+}
+
+// subkeyNames lists loc's subkeys. A key of thousands, as Classes, is listed
+// in parts at once, each on its own handle, which takes half as long.
+func subkeyNames(loc regLoc) ([]string, error) {
+	k, err := registry.OpenKey(loc.hive, loc.path, registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE|registry.WOW64_64KEY)
+	if err != nil {
+		return nil, err
+	}
+	defer k.Close()
+	info, err := k.Stat()
+	if err != nil || info.SubKeyCount < 2048 {
+		names, _ := k.ReadSubKeyNames(-1)
+		return names, nil
+	}
+	const parts = 4
+	n := info.SubKeyCount
+	names := make([]string, n)
+	var wg sync.WaitGroup
+	for p := range uint32(parts) {
+		wg.Go(func() {
+			pk, err := registry.OpenKey(loc.hive, loc.path, registry.ENUMERATE_SUB_KEYS|registry.WOW64_64KEY)
+			if err != nil {
+				return
+			}
+			defer pk.Close()
+			var buf [256]uint16 // key names are at most 255 characters
+			for i := n * p / parts; i < n*(p+1)/parts; i++ {
+				l := uint32(len(buf))
+				if windows.RegEnumKeyEx(windows.Handle(pk), i, &buf[0], &l, nil, nil, nil, nil) == nil {
+					names[i] = windows.UTF16ToString(buf[:l])
+				}
+			}
+		})
+	}
+	wg.Wait()
+	// Keys taken away meanwhile leave gaps.
+	return slices.DeleteFunc(names, func(n string) bool { return n == "" }), nil
 }
 
 func keyExists(hive registry.Key, path string) bool {
@@ -1310,6 +1406,22 @@ func cleanPublisher(p string) string {
 // norm is a name folded for comparing: lower case, letters, digits, + and
 // # only, so that "Notepad++", "notepad++" and "Notepad ++" are one name.
 func norm(s string) string {
+	buf := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= utf8.RuneSelf:
+			return normSlow(s)
+		case c >= 'A' && c <= 'Z':
+			buf = append(buf, c+'a'-'A')
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '+', c == '#':
+			buf = append(buf, c)
+		}
+	}
+	return string(buf)
+}
+
+func normSlow(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range strings.ToLower(s) {
