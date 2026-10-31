@@ -53,9 +53,8 @@ func TestViewLayoutBoundaries(t *testing.T) {
 				for _, l := range m.leftovers {
 					name, parent := shortPath(&l)
 					if r, ok := tt.Find(name); ok && r.Y >= list.Y+tableHeader && r.Y < list.Y+list.H {
-						why, _ := splitReason(l.Reason)
-						meta, ok := tt.Find(why + " · " + parent)
-						if !ok || meta.Y+meta.H > list.Y+list.H+1 {
+						meta, ok := tt.Find(parent)
+						if !ok || meta.Y+meta.H > list.Y+list.H+1 || r.Y+r.H > list.Y+list.H+1 {
 							t.Fatal("initial table clips a row")
 						}
 					}

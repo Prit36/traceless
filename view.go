@@ -77,17 +77,18 @@ var appColumns = []ui.TableColumn{
 	{Title: "Installed", Width: 112, Sortable: true},
 }
 
-// A leftover's row gives the room to its path, which is what tells whether
-// it is the app's: its name, and under it why it was found and where it is.
+// The leftovers are a tree, as WizTree's duplicates: a section's row and a
+// group's sum up the rows under them, which they fold away; a leftover's row
+// is its name and where it is, on one line.
 var leftoverColumns = []ui.TableColumn{
-	{Title: "", ID: "check", Width: 40, Fixed: true, Align: ui.Center},
-	{Title: "Item", MinWidth: 240},
+	{Title: "Name", MinWidth: 280},
+	{Title: "Location", MinWidth: 160},
 	{Title: "Size", Width: 90, Align: ui.End},
 }
 
 const (
-	leftoverRow   = 52 // DIPs, including the table cell's 12-DIP vertical padding.
-	headerRow     = 32 // a section's header
+	leftoverRow   = 32 // DIPs, including the table cell's 12-DIP vertical padding.
+	treeIndent    = 24 // a level of the leftovers tree: the expander and the gap after it
 	tableHeader   = 32
 	resultsHeader = 48
 )
@@ -129,27 +130,33 @@ type model struct {
 	scanCancel context.CancelFunc
 	sizing     bool
 
-	phase                    phase
-	open                     bool
-	target                   *App
-	quiet                    bool
-	run                      *Uninstall
-	runErr                   error
-	gone                     bool // the app's entry went away as its uninstaller ran
-	leftovers                []Leftover
-	rows                     []int // the leftovers table's rows: indexes, or a section's header
-	rowsItems                []Leftover
-	fileCount, registryCount int
-	rowList                  ui.ListState
-	result                   CleanResult
-	toast                    string
+	phase     phase
+	open      bool
+	target    *App
+	quiet     bool
+	run       *Uninstall
+	runErr    error
+	gone      bool // the app's entry went away as its uninstaller ran
+	leftovers []Leftover
+	tree      []leftoverNode // the leftovers table's rows, folded or not
+	rows      []int          // the tree's rows shown
+	rowsItems []Leftover
+	folded    map[string]bool // the sections and groups shown as their row only
+	rowList   ui.ListState
+	result    CleanResult
+	toast     string
 }
 
-// The headers of the leftovers table's sections.
-const (
-	rowFiles    = -1
-	rowRegistry = -2
-)
+// leftoverNode is a row of the leftovers tree: a section, a group of the
+// leftovers found for one reason, or a leftover.
+type leftoverNode struct {
+	key      string // a section's or a group's, "" for a leftover
+	title    string
+	location string // where its leftovers are, when they are all in one place
+	glyph    rune
+	level    int
+	items    []int // the leftovers it holds, or is
+}
 
 func newModel(elevated bool) *model {
 	return &model{
@@ -917,7 +924,7 @@ func (m *model) close() {
 		m.toast = fmt.Sprintf("Removed %s of %s", plural(m.result.Removed, "leftover"), m.target.Name)
 	}
 	m.phase, m.run = phaseNone, nil
-	m.target, m.leftovers, m.rowsItems, m.rows = nil, nil, nil, nil
+	m.target, m.leftovers, m.rowsItems, m.tree, m.rows = nil, nil, nil, nil, nil
 	m.result = CleanResult{}
 	m.rowList = ui.ListState{}
 }
@@ -934,7 +941,7 @@ func (m *model) dialog(c *ui.Context, t *ui.Theme) {
 	width := float32(520)
 	switch {
 	case m.phase == phaseResults && len(m.leftovers) > 0:
-		width = 1000
+		width = 860
 	case m.phase == phaseReport && len(m.result.Failed) > 0:
 		width = 820
 	}
@@ -1114,29 +1121,93 @@ func (m *model) busy(c *ui.Context, t *ui.Theme, title, msg string) {
 	})
 }
 
-// leftoverRows lays the leftovers out in the table: files and folders,
-// then the registry, each under its header.
+// foldAt is the number of registry entries above which the registry's
+// groups start folded, leaving the room to the files, which are the ones to
+// look over.
+const foldAt = 8
+
+// leftoverRows lays the leftovers out as a tree: files and folders, then
+// the registry, each in groups of the leftovers found for one reason. A
+// group of one is its leftover.
 func (m *model) leftoverRows() {
 	if len(m.rowsItems) == len(m.leftovers) && (len(m.leftovers) == 0 || &m.rowsItems[0] == &m.leftovers[0]) {
 		return
 	}
 	m.rowsItems = m.leftovers
-	m.fileCount, m.registryCount = 0, 0
-	m.rows = m.rows[:0]
-	for _, section := range []int{rowFiles, rowRegistry} {
-		at := len(m.rows)
+	m.tree = m.tree[:0]
+	m.folded = map[string]bool{}
+	for _, registry := range []bool{false, true} {
+		var reasons []string
+		groups := map[string][]int{}
 		for i, l := range m.leftovers {
-			if l.IsRegistry() == (section == rowRegistry) {
-				if section == rowFiles {
-					m.fileCount++
-				} else {
-					m.registryCount++
-				}
-				if len(m.rows) == at {
-					m.rows = append(m.rows, section)
-				}
-				m.rows = append(m.rows, i)
+			if l.IsRegistry() != registry {
+				continue
 			}
+			why, _ := splitReason(l.Reason)
+			if groups[why] == nil {
+				reasons = append(reasons, why)
+			}
+			groups[why] = append(groups[why], i)
+		}
+		if len(reasons) == 0 {
+			continue
+		}
+		section := leftoverNode{key: "files", title: "Files and folders", glyph: glyphFolder}
+		if registry {
+			section = leftoverNode{key: "registry", title: "Registry", glyph: glyphKey}
+		}
+		at := len(m.tree)
+		m.tree = append(m.tree, section)
+		for _, why := range reasons {
+			items := groups[why]
+			m.tree[at].items = append(m.tree[at].items, items...)
+			level := 1
+			if len(items) > 1 {
+				g := leftoverNode{key: section.key + "/" + why, title: why, glyph: leftoverGlyph(&m.leftovers[items[0]]), level: 1, items: items}
+				_, g.location = shortPath(&m.leftovers[items[0]])
+				for _, i := range items[1:] {
+					if _, p := shortPath(&m.leftovers[i]); p != g.location {
+						g.location = ""
+					}
+				}
+				m.tree = append(m.tree, g)
+				level = 2
+			}
+			for _, i := range items {
+				m.tree = append(m.tree, leftoverNode{level: level, items: []int{i}})
+			}
+		}
+		if registry && len(m.tree[at].items) > foldAt {
+			for _, n := range m.tree[at+1:] {
+				if n.key != "" {
+					m.folded[n.key] = true
+				}
+			}
+		}
+	}
+}
+
+// layOutRows shows the tree's rows but those under a folded one.
+func (m *model) layOutRows() {
+	m.rows = m.rows[:0]
+	hide := -1 // the level of the folded row whose rows are hidden
+	for j, n := range m.tree {
+		if hide >= 0 && n.level > hide {
+			continue
+		}
+		hide = -1
+		m.rows = append(m.rows, j)
+		if n.key != "" && m.folded[n.key] {
+			hide = n.level
+		}
+	}
+}
+
+// foldAll folds every group, or unfolds every section and group.
+func (m *model) foldAll(fold bool) {
+	for _, n := range m.tree {
+		if n.key != "" {
+			m.folded[n.key] = fold && n.level > 0
 		}
 	}
 }
@@ -1167,6 +1238,7 @@ func (m *model) resultsView(c *ui.Context, t *ui.Theme) {
 		return
 	}
 	m.leftoverRows()
+	m.layOutRows()
 	// Keep a stable title area as the summary changes during measurement.
 	ui.Row(c).Height(resultsHeader).Padding(8, contentInset).Gap(16).AlignItems(ui.Center).Shrink(0).Children(func() {
 		ui.Row(c).Grow(1).Shrink(1).Gap(12).AlignItems(ui.Center).Children(func() {
@@ -1192,20 +1264,33 @@ func (m *model) resultsView(c *ui.Context, t *ui.Theme) {
 					m.leftovers[i].Selected = false
 				}
 			}
+			unfolded := true
+			for _, folded := range m.folded {
+				unfolded = unfolded && !folded
+			}
+			if unfolded {
+				if ui.Button(c.Key("fold"), "Collapse all").Height(controlHeight).Padding(6, 10).Clicked() {
+					m.foldAll(true)
+				}
+			} else if ui.Button(c.Key("fold"), "Expand all").Height(controlHeight).Padding(6, 10).Clicked() {
+				m.foldAll(false)
+			}
 		}).Label("Selection").Shrink(0)
 	})
+	// Sections and groups are rows, not the list's pinned headers, which
+	// covered the rows under them: a row has room for the check box that
+	// chooses all it holds.
 	m.rowList.Key = func(i int) any {
-		if r := m.rows[i]; r >= 0 {
-			return m.leftovers[r].Display()
+		if n := &m.tree[m.rows[i]]; n.key != "" {
+			return n.key
 		}
-		return m.rows[i]
+		return m.leftovers[m.tree[m.rows[i]].items[0]].Display()
 	}
-	m.rowList.Header = func(i int) bool { return m.rows[i] < 0 }
 	m.rowList.Label = func(i int) string {
-		if r := m.rows[i]; r >= 0 {
-			return m.leftovers[r].Display()
+		if n := &m.tree[m.rows[i]]; n.key != "" {
+			return n.title
 		}
-		return ""
+		return m.leftovers[m.tree[m.rows[i]].items[0]].Display()
 	}
 	// The table shows its rows whole, as far as the window has room for
 	// them with the title and the buttons.
@@ -1254,77 +1339,128 @@ func (m *model) resultsView(c *ui.Context, t *ui.Theme) {
 	})
 }
 
-// leftoversHeight fits whole rows on first opening; scrolling still reaches
-// every item. Do not leave a section header without its first item.
+// leftoversHeight fits whole rows of the tree unfolded, so that the dialog
+// keeps its size as rows fold; scrolling still reaches every item.
 func (m *model) leftoversHeight(room float32) float32 {
-	h := float32(tableHeader + 2)
-	for _, r := range m.rows {
-		next := float32(leftoverRow)
-		if r < 0 {
-			next = headerRow
-			if h+next+leftoverRow > room {
-				break
-			}
-		}
-		if h+next > room {
-			break
-		}
-		h += next
-	}
-	return h
+	fit := int((room - tableHeader - 2) / leftoverRow)
+	return tableHeader + 2 + float32(max(1, min(len(m.tree), fit)))*leftoverRow
 }
 
+func leftoverGlyph(l *Leftover) rune {
+	switch {
+	case l.Kind == KindFile && strings.EqualFold(filepath.Ext(l.Path), ".lnk"):
+		return glyphLink
+	case l.Kind == KindFile:
+		return glyphFile
+	case l.IsRegistry():
+		return glyphKey
+	}
+	return glyphFolder
+}
+
+// leftoverCell is a cell of the leftovers tree. The first of a section's
+// or a group's row holds its expander, its check box, mixed while only some
+// of what it holds is chosen, and its name and count; a click on the name
+// folds it too.
 func (m *model) leftoverCell(c *ui.Context, t *ui.Theme, row, col int) {
-	r := m.rows[row]
-	if r < 0 { // a section's header
-		title, g := "Files and folders", glyphFolder
-		if r == rowRegistry {
-			title, g = "Registry", glyphKey
-		}
-		n := m.fileCount
-		if r == rowRegistry {
-			n = m.registryCount
-		}
-		ui.Row(c).MinHeight(headerRow - 12).Gap(12).AlignItems(ui.Center).Children(func() {
-			ui.Box(c).Size(20, 20).Shrink(0).Center().Children(func() { glyph(c, g).FontSize(14) })
-			ui.Text(c, title).FontSize(12.5).FixedLineHeight(18)
-			ui.Text(c, fmt.Sprint(n)).FontSize(12).FixedLineHeight(16).FontWeight(400).TextColor(t.TextMuted)
-		})
+	n := &m.tree[m.rows[row]]
+	if n.key == "" {
+		m.leafCell(c, t, &m.leftovers[n.items[0]], n.level, col)
 		return
 	}
-	l := &m.leftovers[r]
+	var chosen int
+	var size int64
+	for _, i := range n.items {
+		size += m.leftovers[i].Size
+		if m.leftovers[i].Selected {
+			chosen++
+		}
+	}
+	section := n.level == 0
 	switch col {
 	case 0:
-		ui.Checkbox(c.Key("check"), &l.Selected, "").Label(l.Display())
-	case 1:
-		g := glyphFolder
-		switch {
-		case l.Kind == KindFile && strings.EqualFold(filepath.Ext(l.Path), ".lnk"):
-			g = glyphLink
-		case l.Kind == KindFile:
-			g = glyphFile
-		case l.IsRegistry():
-			g = glyphKey
-		}
-		name, parent := shortPath(l)
-		why, doubt := splitReason(l.Reason)
-		ui.Row(c).MinHeight(leftoverRow - 12).Gap(12).AlignItems(ui.Center).Shrink(1).Grow(1).Tooltip(l.Display() + "\n" + l.Reason).Children(func() {
-			ui.Box(c).Size(20, 20).Shrink(0).Center().Children(func() { glyph(c, g).FontSize(18).TextColor(t.TextMuted) })
-			ui.Column(c).Gap(4).Grow(1).Shrink(1).Children(func() {
-				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, name).FixedLineHeight(18).SingleLine().Shrink(1)
-					switch {
-					case doubt != "":
-						m.tag(c, t, doubt, m.pal.warning).Label("Possible match: " + doubt)
-					case !l.Sure:
-						m.tag(c, t, "Possible match", m.pal.warning)
-					}
+		open := !m.folded[n.key]
+		// The rows shown change on the next frame, not while the table
+		// builds these.
+		toggle := func() { m.folded[n.key] = open }
+		ui.Row(c).MinHeight(leftoverRow - 12).PaddingStart(float32(n.level) * treeIndent).Gap(4).AlignItems(ui.Center).Grow(1).Shrink(1).Children(func() {
+			chevron := glyphChevronDown
+			if !open {
+				chevron = glyphChevronRight
+			}
+			if ui.ButtonBase(c.Key("expander")).Size(20, 20).Shrink(0).Cursor(ui.CursorPointer).Expanded(open).Label(n.title).
+				Children(func() { glyph(c, chevron).FontSize(10).TextColor(t.TextMuted) }).Clicked() {
+				toggle()
+			}
+			on := chosen == len(n.items)
+			box := ui.Checkbox(c.Key("check"), &on, "").Label("Choose all of " + n.title)
+			if chosen > 0 && !on {
+				// A click on a mixed box chooses all it holds.
+				box.Mixed().DrawOver(func(p *ui.Painter, b ui.Rect) {
+					s := min(b.W, b.H)
+					x, y := b.X+(b.W-s)/2, b.Y+(b.H-s)/2
+					p.Fill(ui.Rect{X: x, Y: y, W: s, H: s}, t.Accent, s/4)
+					p.Fill(ui.Rect{X: x + s/4, Y: y + s/2 - 1, W: s / 2, H: 2}, t.AccentText, 1)
 				})
-				ui.Text(c, why+" · "+parent).FontSize(12).FixedLineHeight(14).TextColor(t.TextMuted).SingleLine().Tooltip(l.Display() + "\n" + l.Reason)
+			}
+			if box.Changed() {
+				for _, i := range n.items {
+					m.leftovers[i].Selected = on
+				}
+			}
+			title := ui.ButtonBase(c.Key("title")).Grow(1).Shrink(1).Gap(8).AlignItems(ui.Center).Justify(ui.Start).PaddingStart(4).
+				Cursor(ui.CursorPointer).Expanded(open).Label(n.title).Tooltip(n.title).Children(func() {
+				glyph(c, n.glyph).FontSize(14).TextColor(t.TextMuted)
+				name := ui.Text(c, n.title).FontSize(13).FixedLineHeight(18).SingleLine().Shrink(1)
+				count := fmt.Sprintf("%d of %d", chosen, len(n.items))
+				if section {
+					name.FontWeight(600)
+					count += " chosen"
+				}
+				ui.Text(c, count).FontSize(12).FixedLineHeight(16).TextColor(t.TextMuted).SingleLine().Shrink(0)
 			})
+			if title.Clicked() {
+				toggle()
+			}
 		})
+	case 1:
+		if n.location != "" {
+			ui.Text(c, n.location).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(1).Tooltip(n.location)
+		}
 	case 2:
-		ui.Text(c, formatBytes(l.Size)).FontSize(13).FontFeatures("tnum").SingleLine()
+		if size > 0 {
+			sz := ui.Text(c, formatBytes(size)).FontSize(12.5).FontFeatures("tnum").SingleLine()
+			if section {
+				sz.FontWeight(600)
+			}
+		}
+	}
+}
+
+// leafCell is a cell of a leftover's row: its check box and name, where it
+// is, and its size.
+func (m *model) leafCell(c *ui.Context, t *ui.Theme, l *Leftover, level, col int) {
+	name, parent := shortPath(l)
+	switch col {
+	case 0:
+		_, doubt := splitReason(l.Reason)
+		// The expander's room, so that the check boxes line up.
+		ui.Row(c).MinHeight(leftoverRow - 12).PaddingStart(float32(level)*treeIndent + 24).Gap(8).AlignItems(ui.Center).Grow(1).Shrink(1).
+			Tooltip(l.Display() + "\n" + l.Reason).Children(func() {
+			ui.Checkbox(c.Key("check"), &l.Selected, "").Label(l.Display())
+			glyph(c, leftoverGlyph(l)).FontSize(14).TextColor(t.TextMuted)
+			ui.Text(c, name).FontSize(13).FixedLineHeight(18).SingleLine().Shrink(1)
+			switch {
+			case doubt != "":
+				m.tag(c, t, doubt, m.pal.warning).Label("Possible match: " + doubt)
+			case !l.Sure:
+				m.tag(c, t, "Possible match", m.pal.warning)
+			}
+		})
+	case 1:
+		ui.Text(c, parent).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(1).Tooltip(l.Display())
+	case 2:
+		ui.Text(c, formatBytes(l.Size)).FontSize(12.5).FontFeatures("tnum").SingleLine()
 	}
 }
 

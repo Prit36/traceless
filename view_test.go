@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -113,7 +114,7 @@ func TestViewFlow(t *testing.T) {
 		t.Fatalf("results: %q", tt.Texts())
 	}
 	snapshot(t, tt, "5-results")
-	last, ok := tt.Find(`Starts with Windows · HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)
+	last, ok := tt.Find(`VLC tray`)
 	remove, _ := tt.Find("Remove 7 items (45.7 MB)")
 	if !ok || last.Y+last.H > remove.Y-8 {
 		t.Fatal("the last leftover is clipped at the default window size")
@@ -131,6 +132,36 @@ func TestViewFlow(t *testing.T) {
 			t.Fatal("Select none left one chosen")
 		}
 	}
+	tt.Click("Select all")
+
+	// A section's box chooses the whole section, and only it; a mixed box
+	// chooses all of its section.
+	section := func(registry, want bool) {
+		t.Helper()
+		for _, l := range m.leftovers {
+			if l.IsRegistry() == registry && l.Selected != want {
+				t.Fatalf("%s: chosen %v, want %v", l.Display(), l.Selected, want)
+			}
+		}
+	}
+	if !tt.HasText("5 of 5 chosen") || !tt.HasText("3 of 3 chosen") {
+		t.Fatalf("section counts: %q", tt.Texts())
+	}
+	if err := tt.Click("Choose all of Registry"); err != nil {
+		t.Fatal(err)
+	}
+	section(true, false)
+	section(false, true)
+	m.leftovers[0].Selected = false
+	tt.Frame()
+	if !tt.HasText("4 of 5 chosen") {
+		t.Fatalf("section counts: %q", tt.Texts())
+	}
+	snapshot(t, tt, "5c-results-sections")
+	if err := tt.Click("Choose all of Files and folders"); err != nil {
+		t.Fatal(err)
+	}
+	section(false, true)
 	tt.Click("Select all")
 
 	// What removing them did.
@@ -190,5 +221,56 @@ func TestViewFlow(t *testing.T) {
 	}
 	if len(m.shown) != 1 || !m.shown[0].Broken {
 		t.Fatalf("uninstaller missing shows %d apps", len(m.shown))
+	}
+}
+
+// A long registry section starts with its groups folded, leaving the room
+// to the files; a group's row unfolds it, and its box chooses all of it.
+func TestLeftoverSectionsFold(t *testing.T) {
+	m := sampleModel()
+	tt := ui.NewTester(m.view, 1060, 700)
+	m.target = m.apps[3]
+	m.leftovers = []Leftover{{Kind: KindFolder, Path: `C:\Users\Ada\AppData\Roaming\vlc`, Reason: "Folder named after the app", Sure: true, Selected: true}}
+	for i := range foldAt + 2 {
+		m.leftovers = append(m.leftovers, Leftover{Kind: KindValue, Hive: registry.CURRENT_USER, Path: `Software\VideoLAN`,
+			Value: fmt.Sprint("setting ", i), Reason: "Setting", Sure: true, Selected: true})
+	}
+	m.phase = phaseResults
+	tt.Frame()
+	// Its entries are one group, found for one reason, which is folded.
+	if tt.HasText("setting 0") || !tt.HasText("10 of 10 chosen") || !tt.HasText("Setting") {
+		t.Fatalf("registry not folded: %q", tt.Texts())
+	}
+	snapshot(t, tt, "5d-results-folded")
+	if err := tt.Click("Choose all of Registry"); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range m.leftovers[1:] {
+		if l.Selected {
+			t.Fatal("a folded section's box left an entry chosen")
+		}
+	}
+	// A click on a row's chevron folds or unfolds it.
+	expand := func(chevron rune) {
+		t.Helper()
+		r, ok := tt.Find(string(chevron))
+		if !ok {
+			t.Fatalf("no expander %q", chevron)
+		}
+		tt.ClickAt(r.X+r.W/2, r.Y+r.H/2)
+	}
+	expand(glyphChevronRight)
+	if !tt.HasText("setting 0") {
+		t.Fatalf("registry not unfolded: %q", tt.Texts())
+	}
+	expand(glyphChevronDown) // the files' section's, the first
+	if tt.HasText("vlc") {
+		t.Fatal("files not folded")
+	}
+	if err := tt.Click("Expand all"); err != nil {
+		t.Fatal(err)
+	}
+	if !tt.HasText("vlc") || !tt.HasText("setting 9") || !tt.HasText("Collapse all") {
+		t.Fatal("Expand all left a row folded")
 	}
 }
