@@ -324,3 +324,90 @@ func TestLoadApps(t *testing.T) {
 	}
 	t.Logf("%d apps", len(apps))
 }
+
+// An app from elsewhere, as OpenCode, keeps its files in the XDG folders of
+// the user's home and in Temp, registers a link handler and a notification
+// server, may have come with a command from npm, and Windows remembers it by
+// its app ID and by programs of its older installs.
+func TestScanFindsToolLeftovers(t *testing.T) {
+	f := newFakeSystem(t)
+	dir := filepath.Join(f.programs, "ai.opencode.desktop")
+	f.file(`Program Files\ai.opencode.desktop\OpenCode.exe`, []byte("exe"))
+	f.file(`.config\opencode\opencode.json`, []byte(`{}`))
+	f.file(`.local\share\opencode\opencode.db`, []byte("db"))
+	f.file(`Temp\opencode\x.tmp`, []byte("x"))
+	f.file(`AppData\@opencodedesktop-updater\installer.exe`, []byte("x"))
+	f.file(`npm\opencode.cmd`, []byte("@node opencode"))
+	f.file(`npm\opencode.ps1`, []byte("node opencode"))
+	f.file(`npm\npm.cmd`, []byte("@node npm"))
+	f.file(`npm\node_modules\opencode-ai\package.json`, []byte(`{}`))
+	f.file(`npm\node_modules\typescript\package.json`, []byte(`{}`))
+	f.key(`Classes\opencode`, map[string]string{"": "URL:opencode", "URL Protocol": ""})
+	f.key(`Classes\opencode\shell\open\command`, map[string]string{"": `"` + dir + `\OpenCode.exe" "%1"`})
+	f.key(`Classes\OpenCodeFile`, map[string]string{"": "not a handler"})
+	gone := filepath.Join(f.root, "Old", "@opencodedesktop", "OpenCode.exe") // an older install's program
+	notepad := filepath.Join(os.Getenv("SystemRoot"), "notepad.exe")
+	f.key(`Usage`, map[string]string{
+		dir + `\OpenCode.exe.FriendlyAppName`: "OpenCode", gone + ".ApplicationCompany": "OpenCode",
+		"ai.opencode.desktop": "", notepad + ".FriendlyAppName": "Notepad", "Microsoft.Windows.Explorer": "",
+	})
+	f.key(`Notifications\ai.opencode.desktop`, nil)
+	f.key(`Notifications\W~ai.opencode.desktop`, nil)
+	f.key(`Notifications\Microsoft.Windows.Explorer`, nil)
+	f.key(`CLSID\{6CD27474-6CF3-4B67-956A-804CA14AFDF3}\LocalServer32`, map[string]string{"": gone})
+	f.key(`CLSID\{00000000-0000-0000-0000-000000000001}\LocalServer32`, map[string]string{"": notepad})
+	f.key(`Software\d074f30d-5f88-5885-b075-be1348cc7676`, map[string]string{"InstallLocation": dir})
+	f.file(`Downloads\opencode-desktop-win-x64.exe`, []byte("x"))
+	f.file(`Downloads\other-setup.exe`, []byte("x"))
+
+	app := fakeApp("OpenCode 2.2.5", "OpenCode", dir)
+	app.DisplayIcon = filepath.Join(dir, "OpenCode.exe") // the test folder is in Temp, so InstallLocation stays
+	app.KeyPath = testKey + `\Uninstall\d074f30d-5f88-5885-b075-be1348cc7676`
+	app.prepare()
+	s := f.scanner(app)
+	s.Dirs = append(s.Dirs, filepath.Join(f.root, ".config"), filepath.Join(f.root, ".local", "share"), filepath.Join(f.root, "Temp"))
+	s.NpmDirs = []string{filepath.Join(f.root, "npm")}
+	hkcuKey := registry.CURRENT_USER
+	s.ClassKeys = []regLoc{{hkcuKey, f.regRoot + `\Classes`}}
+	s.UsageKeys = []regLoc{{hkcuKey, f.regRoot + `\Usage`}}
+	s.IDKeys = []regLoc{{hkcuKey, f.regRoot + `\Notifications`}}
+	s.ServerKeys = []regLoc{{hkcuKey, f.regRoot + `\CLSID`}}
+	s.DownloadDirs = []string{filepath.Join(f.root, "Downloads")}
+	found := paths(s.Scan())
+
+	hkcu := `HKEY_CURRENT_USER\` + testKey
+	want := map[string]bool{ // path: selected
+		dir: true,
+		filepath.Join(f.root, ".config", "opencode"):                       true,
+		filepath.Join(f.root, ".local", "share", "opencode"):               true,
+		filepath.Join(f.root, "Temp", "opencode"):                          true,
+		filepath.Join(f.appData, "@opencodedesktop-updater"):               false,
+		filepath.Join(f.root, "npm", "opencode.cmd"):                       false, // the command line tool is another install
+		filepath.Join(f.root, "npm", "opencode.ps1"):                       false,
+		filepath.Join(f.root, "npm", "node_modules", "opencode-ai"):        false,
+		hkcu + `\Classes\opencode`:                                         true,
+		filepath.Join(f.root, "Downloads", "opencode-desktop-win-x64.exe"): false, // the user's own file
+		hkcu + `\Usage  ›  ` + dir + `\OpenCode.exe.FriendlyAppName`:       true,
+		hkcu + `\Usage  ›  ` + gone + `.ApplicationCompany`:                true,
+		hkcu + `\Usage  ›  ai.opencode.desktop`:                            true,
+		hkcu + `\Notifications\ai.opencode.desktop`:                        true,
+		hkcu + `\Notifications\W~ai.opencode.desktop`:                      true,
+		hkcu + `\CLSID\{6CD27474-6CF3-4B67-956A-804CA14AFDF3}`:             true,
+		hkcu + `\Software\d074f30d-5f88-5885-b075-be1348cc7676`:            true,
+	}
+	for p, sel := range want {
+		l, ok := found[p]
+		if !ok {
+			t.Errorf("not found: %s", p)
+			continue
+		}
+		if l.Selected != sel {
+			t.Errorf("%s: selected %v, want %v (%s)", p, l.Selected, sel, l.Reason)
+		}
+	}
+	for p := range found {
+		if _, ok := want[p]; !ok {
+			t.Errorf("unexpected leftover: %s (%s)", p, found[p].Reason)
+		}
+	}
+}

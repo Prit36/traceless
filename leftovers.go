@@ -74,11 +74,17 @@ type Scanner struct {
 	Dirs         []string // folders whose entries may be the app's
 	MaybeDirs    []string // the same, whose entries may hold the user's own files
 	ShortcutDirs []string // folders whose shortcuts may lead to the app
+	NpmDirs      []string // npm's global folders, of commands and their packages
+	DownloadDirs []string // folders the user downloads to, which may hold the app's installer
 	NameKeys     []regLoc // keys whose subkeys may be the app's
+	ClassKeys    []regLoc // Classes keys, of link handlers as name://
 	RunKeys      []regLoc // keys of programs that start with Windows
 	AppPathKeys  []regLoc
 	AppKeys      []regLoc // Classes\Applications, by program name
-	MuiKeys      []regLoc // where Explorer keeps the names of programs it ran
+	UsageKeys    []regLoc // keys whose value names are programs Windows ran, by path or app ID
+	IDKeys       []regLoc // keys whose subkeys are named by app IDs, as notification settings
+	ServerKeys   []regLoc // CLSID keys, of programs started for notifications and the like
+	AudioKeys    []regLoc // where Windows keeps the sound device chosen for each program
 	Protected    map[string]bool
 
 	self      string
@@ -101,15 +107,29 @@ func NewScanner(app *App, all []*App) *Scanner {
 		env("ProgramFiles"), env("ProgramFiles(x86)"), env("ProgramW6432"),
 		env("CommonProgramFiles"), env("CommonProgramFiles(x86)"),
 		env("ProgramData"), roaming, local, filepath.Join(local, "Programs"),
-		filepath.Join(profile, "AppData", "LocalLow"),
+		filepath.Join(profile, "AppData", "LocalLow"), filepath.Join(local, "Temp"),
 	)
+	// Apps from Linux and macOS, and command-line tools, keep their files in
+	// the XDG folders of the user's home.
+	if profile != "" {
+		s.Dirs = nonEmpty(slices.Concat(s.Dirs, []string{
+			env("XDG_CONFIG_HOME"), env("XDG_CACHE_HOME"), env("XDG_DATA_HOME"), env("XDG_STATE_HOME"),
+			filepath.Join(profile, ".config"), filepath.Join(profile, ".cache"),
+			filepath.Join(profile, ".local", "share"), filepath.Join(profile, ".local", "state"),
+		})...)
+	}
+	if roaming != "" {
+		s.NpmDirs = []string{filepath.Join(roaming, "npm")}
+	}
 	s.MaybeDirs = nonEmpty(knownFolder(windows.FOLDERID_Documents), profile)
+	s.DownloadDirs = nonEmpty(knownFolder(windows.FOLDERID_Downloads))
 	s.ShortcutDirs = nonEmpty(
 		knownFolder(windows.FOLDERID_Programs), knownFolder(windows.FOLDERID_CommonPrograms),
 		knownFolder(windows.FOLDERID_Desktop), knownFolder(windows.FOLDERID_PublicDesktop),
 	)
 	hkcu, hklm := registry.CURRENT_USER, registry.LOCAL_MACHINE
 	s.NameKeys = []regLoc{{hkcu, `Software`}, {hklm, `SOFTWARE`}, {hklm, `SOFTWARE\WOW6432Node`}}
+	s.ClassKeys = []regLoc{{hkcu, `Software\Classes`}, {hklm, `SOFTWARE\Classes`}}
 	s.RunKeys = []regLoc{
 		{hkcu, `Software\Microsoft\Windows\CurrentVersion\Run`},
 		{hkcu, `Software\Microsoft\Windows\CurrentVersion\RunOnce`},
@@ -123,7 +143,20 @@ func NewScanner(app *App, all []*App) *Scanner {
 		{hklm, `SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths`},
 	}
 	s.AppKeys = []regLoc{{hkcu, `Software\Classes\Applications`}, {hklm, `SOFTWARE\Classes\Applications`}}
-	s.MuiKeys = []regLoc{{hkcu, `Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache`}}
+	cv := `Software\Microsoft\Windows\CurrentVersion\`
+	s.UsageKeys = []regLoc{
+		{hkcu, `Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache`},
+		{hkcu, cv + `Explorer\FeatureUsage\AppSwitched`}, {hkcu, cv + `Explorer\FeatureUsage\AppLaunch`},
+		{hkcu, cv + `Explorer\FeatureUsage\AppBadgeUpdated`}, {hkcu, cv + `Explorer\FeatureUsage\ShowJumpView`},
+		{hkcu, cv + `Search\JumplistData`},
+		{hkcu, `Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store`},
+		{hkcu, `Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers`},
+	}
+	s.IDKeys = []regLoc{
+		{hkcu, cv + `Notifications\Settings`}, {hkcu, cv + `PushNotifications\Backup`}, {hkcu, cv + `Start\TileProperties`},
+	}
+	s.ServerKeys = []regLoc{{hkcu, `Software\Classes\CLSID`}}
+	s.AudioKeys = []regLoc{{hkcu, `Software\Microsoft\Internet Explorer\LowRegistry\Audio\PolicyConfig\PropertyStore`}}
 
 	s.Protected = make(map[string]bool)
 	for _, p := range slices.Concat(s.Dirs, s.MaybeDirs, s.ShortcutDirs, nonEmpty(
@@ -194,6 +227,12 @@ func (s *Scanner) Discover(ctx context.Context) []Leftover {
 	}
 	for _, dir := range s.ShortcutDirs {
 		jobs = append(jobs, func(f *found) { s.scanShortcuts(dir, t, f) })
+	}
+	for _, dir := range s.NpmDirs {
+		jobs = append(jobs, func(f *found) { s.scanNpm(dir, t, f) })
+	}
+	for _, dir := range s.DownloadDirs {
+		jobs = append(jobs, func(f *found) { s.scanDownloads(dir, t, f) })
 	}
 	jobs = append(jobs, func(f *found) { s.scanRegistry(t, f) })
 	if len(jobs) <= 2 {
@@ -612,6 +651,39 @@ func (s *Scanner) checkShortcut(path string, t *tokens, f *found) {
 	}
 }
 
+// scanNpm looks for commands named after the app in npm's global folder, and
+// for their packages. They are another install of the app, as its command
+// line tool, so the user chooses them.
+func (s *Scanner) scanNpm(dir string, t *tokens, f *found) {
+	if s.cancelled() {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if e.IsDir() || e.Type()&fs.ModeSymlink != 0 || (ext != "" && ext != ".cmd" && ext != ".ps1") {
+			continue
+		}
+		if sure, maybe, other := t.match(strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))); sure || maybe {
+			f.add(Leftover{Kind: KindFile, Path: filepath.Join(dir, e.Name()), Reason: reason("npm command named after the app", other, true)})
+		}
+	}
+	modules := filepath.Join(dir, "node_modules")
+	entries, _ = os.ReadDir(modules)
+	for _, e := range entries {
+		if !e.IsDir() || e.Type()&fs.ModeSymlink != 0 {
+			continue
+		}
+		full := filepath.Join(modules, e.Name())
+		if sure, maybe, other := t.match(e.Name()); (sure || maybe) && s.removable(full) {
+			f.add(Leftover{Kind: KindFolder, Path: full, Reason: reason("npm package named after the app", other, true)})
+		}
+	}
+}
+
 // fileMentions reports whether a small file, as a shortcut, holds path, in
 // ANSI or UTF-16, ignoring case. Shortcuts keep their target in both.
 func fileMentions(file, path string) bool {
@@ -745,6 +817,9 @@ func (s *Scanner) scanRegistry(t *tokens, f *found) {
 			}
 		})
 	}
+	for _, loc := range s.ClassKeys {
+		s.scanClasses(loc, t, f, mentionsDir)
+	}
 	if t.exe != "" {
 		for _, loc := range s.AppKeys {
 			path := loc.path + `\` + t.exe
@@ -754,20 +829,26 @@ func (s *Scanner) scanRegistry(t *tokens, f *found) {
 			}
 		}
 	}
-	if prefix != "" {
-		for _, loc := range s.MuiKeys {
-			k, err := registry.OpenKey(loc.hive, loc.path, registry.QUERY_VALUE)
-			if err != nil {
-				continue
-			}
-			names, _ := k.ReadValueNames(-1)
-			k.Close()
-			for _, name := range names {
-				if mentionsDir(name) {
-					f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: loc.path, Value: name, Reason: "Program name Explorer remembers", Sure: true})
-				}
+	// Electron's installers keep the install folder in a key named as the
+	// app's entry in the list of installed apps.
+	if id := filepath.Base(a.KeyPath); len(id) >= 32 && strings.Count(id, "-") >= 4 {
+		for _, loc := range s.NameKeys {
+			if path := loc.path + `\` + id; keyExists(loc.hive, path) {
+				f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: path, Reason: "Installer's record of the app", Sure: true})
 			}
 		}
+	}
+	for _, loc := range s.UsageKeys {
+		s.scanUsage(loc, t, f, prefix)
+	}
+	for _, loc := range s.IDKeys {
+		s.scanIDKeys(loc, t, f)
+	}
+	for _, loc := range s.ServerKeys {
+		s.scanServers(loc, t, f, prefix)
+	}
+	for _, loc := range s.AudioKeys {
+		s.scanAudio(loc, t, f, prefix)
 	}
 }
 
@@ -819,6 +900,205 @@ func (s *Scanner) scanKeys(loc regLoc, t *tokens, f *found) {
 		}
 		for _, l := range mine {
 			f.add(l)
+		}
+	}
+}
+
+// scanClasses looks for the app's link handlers, as opencode:// is, and the
+// file types that open in its program: keys named after the app, which say
+// they are links or whose command runs a program in the install folder.
+func (s *Scanner) scanClasses(loc regLoc, t *tokens, f *found, mentionsDir func(string) bool) {
+	if s.cancelled() {
+		return
+	}
+	k, err := registry.OpenKey(loc.hive, loc.path, registry.ENUMERATE_SUB_KEYS|registry.WOW64_64KEY)
+	if err != nil {
+		return
+	}
+	names, _ := k.ReadSubKeyNames(-1)
+	k.Close()
+	for _, name := range names {
+		if s.cancelled() {
+			return
+		}
+		if name == "" || name[0] == '.' || name[0] == '{' || name[0] == '*' {
+			continue
+		}
+		sure, maybe, other := t.match(name)
+		if !sure && !maybe {
+			continue
+		}
+		path := loc.path + `\` + name
+		link := hasValue(loc.hive, path, "URL Protocol")
+		cmd := ""
+		if ck, err := registry.OpenKey(loc.hive, path+`\shell\open\command`, registry.QUERY_VALUE|registry.WOW64_64KEY); err == nil {
+			cmd = str(ck, "")
+			ck.Close()
+		}
+		intoApp := mentionsDir(cmd)
+		if !link && !intoApp {
+			continue
+		}
+		why := "File type that opens in the app"
+		if link {
+			why = "Link handler " + strings.ToLower(name) + "://"
+		}
+		// A handler whose program is elsewhere and still there is another app's.
+		mine := intoApp || (sure && (cmd == "" || !commandExists(cmd)))
+		f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: path, Reason: reason(why, other, true), Sure: mine})
+	}
+}
+
+// programIsApp tells whether a program Windows remembers by its path is the
+// app's: it is in the install folder, or it is gone and it or its folder is
+// named after the app, as when an older version was installed elsewhere.
+func (s *Scanner) programIsApp(path string, t *tokens, prefix string) (sure, maybe bool) {
+	l := strings.ToLower(path)
+	if prefix != "" && strings.HasPrefix(l, prefix) {
+		return true, false
+	}
+	if !filepath.IsAbs(path) || !strings.HasSuffix(l, ".exe") {
+		return false, false
+	}
+	name := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	sure, maybe, _ = t.match(name)
+	for d, i := filepath.Dir(path), 0; i < 3 && depth(d) >= 2 && !sure; d, i = filepath.Dir(d), i+1 {
+		ds, dm, _ := t.match(filepath.Base(d))
+		sure, maybe = sure || ds, maybe || dm
+	}
+	if (!sure && !maybe) || exists(path) {
+		return false, false
+	}
+	return sure, maybe && !sure
+}
+
+// exePath is the program's path in a value name as "C:\App\app.exe.FriendlyAppName".
+func exePath(name string) string {
+	if i := strings.LastIndex(strings.ToLower(name), ".exe"); i >= 0 {
+		return name[:i+4]
+	}
+	return name
+}
+
+// scanUsage looks for the values Windows keeps of programs it ran, named by
+// the program's path or by the app's ID, as ai.opencode.desktop.
+func (s *Scanner) scanUsage(loc regLoc, t *tokens, f *found, prefix string) {
+	if s.cancelled() {
+		return
+	}
+	k, err := registry.OpenKey(loc.hive, loc.path, registry.QUERY_VALUE|registry.WOW64_64KEY)
+	if err != nil {
+		return
+	}
+	names, _ := k.ReadValueNames(-1)
+	k.Close()
+	for _, name := range names {
+		var sure, maybe bool
+		if strings.ContainsRune(name, '\\') {
+			sure, maybe = s.programIsApp(exePath(name), t, prefix)
+		} else if strings.ContainsRune(name, '.') {
+			sure, maybe, _ = t.match(name)
+		}
+		if sure || maybe {
+			f.add(Leftover{Kind: KindValue, Hive: loc.hive, Path: loc.path, Value: name, Reason: "What Windows remembers of the app's program", Sure: sure})
+		}
+	}
+}
+
+// scanIDKeys looks for keys named by the app's ID, as its notification
+// settings.
+func (s *Scanner) scanIDKeys(loc regLoc, t *tokens, f *found) {
+	if s.cancelled() {
+		return
+	}
+	k, err := registry.OpenKey(loc.hive, loc.path, registry.ENUMERATE_SUB_KEYS|registry.WOW64_64KEY)
+	if err != nil {
+		return
+	}
+	names, _ := k.ReadSubKeyNames(-1)
+	k.Close()
+	for _, name := range names {
+		if sure, maybe, other := t.match(strings.TrimPrefix(name, "W~")); sure || maybe {
+			f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: loc.path + `\` + name, Reason: reason("Windows settings of the app", other, true), Sure: sure})
+		}
+	}
+}
+
+// scanServers looks for COM servers that run the app's program, as the one
+// Electron apps register to answer their notifications.
+func (s *Scanner) scanServers(loc regLoc, t *tokens, f *found, prefix string) {
+	forSubkeys(loc, func(name string, _ registry.Key) {
+		for _, sub := range []string{`LocalServer32`, `InprocServer32`} {
+			k, err := registry.OpenKey(loc.hive, loc.path+`\`+name+`\`+sub, registry.QUERY_VALUE|registry.WOW64_64KEY)
+			if err != nil {
+				continue
+			}
+			target := commandExe(str(k, ""))
+			k.Close()
+			if sure, maybe := s.programIsApp(target, t, prefix); sure || maybe {
+				f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: loc.path + `\` + name, Reason: "Program Windows starts for the app's notifications", Sure: sure})
+				return
+			}
+		}
+	})
+}
+
+var deviceVolumeRe = regexp.MustCompile(`(?i)(\\Device\\HarddiskVolume\d+)(\\.*\.exe)`)
+
+// volumeDrives maps volumes, as \device\harddiskvolume3 in lower case, to
+// their drive letters.
+func volumeDrives() map[string]string {
+	drives := make(map[string]string)
+	buf := make([]uint16, windows.MAX_PATH)
+	for c := 'A'; c <= 'Z'; c++ {
+		drive := string(c) + ":"
+		name, _ := windows.UTF16PtrFromString(drive)
+		if n, err := windows.QueryDosDevice(name, &buf[0], uint32(len(buf))); err == nil && n > 0 {
+			drives[strings.ToLower(windows.UTF16ToString(buf))] = drive
+		}
+	}
+	return drives
+}
+
+// scanAudio looks for the sound devices chosen for the app's program, which
+// Windows keeps by the program's path on its volume, as \Device\HarddiskVolume3\.
+func (s *Scanner) scanAudio(loc regLoc, t *tokens, f *found, prefix string) {
+	var drives map[string]string
+	forSubkeys(loc, func(name string, k registry.Key) {
+		m := deviceVolumeRe.FindStringSubmatch(str(k, ""))
+		if m == nil {
+			return
+		}
+		if drives == nil {
+			drives = volumeDrives()
+		}
+		drive, ok := drives[strings.ToLower(m[1])]
+		if !ok {
+			return
+		}
+		if sure, maybe := s.programIsApp(drive+m[2], t, prefix); sure || maybe {
+			f.add(Leftover{Kind: KindKey, Hive: loc.hive, Path: loc.path + `\` + name, Reason: "Sound device chosen for the app", Sure: sure})
+		}
+	})
+}
+
+// scanDownloads looks for the app's installers among the user's downloads.
+// They are the user's own files, so the user chooses them.
+func (s *Scanner) scanDownloads(dir string, t *tokens, f *found) {
+	if s.cancelled() {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		ext := strings.ToLower(filepath.Ext(e.Name()))
+		if e.IsDir() || (ext != ".exe" && ext != ".msi" && ext != ".msix" && ext != ".zip" && ext != ".7z") {
+			continue
+		}
+		if sure, maybe, other := t.match(strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))); sure || maybe {
+			f.add(Leftover{Kind: KindFile, Path: filepath.Join(dir, e.Name()), Reason: reason("Installer of the app you downloaded", other, true)})
 		}
 	}
 }
