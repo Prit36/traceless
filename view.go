@@ -32,9 +32,12 @@ const (
 )
 
 const (
-	iconSize  = 20 // DIPs, in the table
-	largeIcon = 32 // in the details pane and the dialogs
-	compactAt = 900
+	iconSize      = 20 // DIPs, in the table
+	largeIcon     = 32 // in the details pane and the dialogs
+	compactAt     = 1000
+	contentInset  = 24
+	tableInset    = contentInset - 10 // Table cells already include 10 DIPs of padding.
+	controlHeight = 32
 )
 
 // A view of the apps, in the navigation pane.
@@ -69,22 +72,24 @@ func navFind(id string) navItem {
 // and where it is, are in the details pane.
 var appColumns = []ui.TableColumn{
 	{Title: "Name", MinWidth: 200, Sortable: true},
-	{Title: "Publisher", Width: 180, Sortable: true},
-	{Title: "Size", Width: 150, Align: ui.End, Sortable: true},
-	{Title: "Installed", Width: 110, Sortable: true},
+	{Title: "Publisher", Width: 156, Sortable: true},
+	{Title: "Size", Width: 140, Align: ui.End, Sortable: true},
+	{Title: "Installed", Width: 112, Sortable: true},
 }
 
 // A leftover's row gives the room to its path, which is what tells whether
 // it is the app's: its name, and under it why it was found and where it is.
 var leftoverColumns = []ui.TableColumn{
-	{Title: "", ID: "check", Width: 40, Fixed: true},
-	{Title: "Item", MinWidth: 300},
+	{Title: "", ID: "check", Width: 40, Fixed: true, Align: ui.Center},
+	{Title: "Item", MinWidth: 240},
 	{Title: "Size", Width: 90, Align: ui.End},
 }
 
 const (
-	leftoverRow = 50 // DIPs, a leftover's two lines
-	headerRow   = 32 // a section's header, and the table's
+	leftoverRow   = 52 // DIPs, including the table cell's 12-DIP vertical padding.
+	headerRow     = 32 // a section's header
+	tableHeader   = 32
+	resultsHeader = 48
 )
 
 // model is the app's state, read and changed on the main thread; work that
@@ -441,11 +446,11 @@ func (m *model) titleBar(c *ui.Context, t *ui.Theme) {
 // navPane chooses which apps the table shows, as Windows 11's navigation
 // pane, down to its icons when the window is narrow.
 func (m *model) navPane(c *ui.Context, t *ui.Theme, compact bool) {
-	width := float32(232)
+	width := float32(240)
 	if compact {
-		width = 56
+		width = 64
 	}
-	ui.Column(c).Width(width).Shrink(0).Padding(4, 6, 10, 6).Gap(3).Children(func() {
+	ui.Column(c).Width(width).Shrink(0).Padding(8, 8, 12, 8).Gap(4).Children(func() {
 		for _, n := range navViews {
 			m.navButton(c, t, n, compact)
 		}
@@ -456,7 +461,7 @@ func (m *model) navPane(c *ui.Context, t *ui.Theme, compact bool) {
 
 func (m *model) navButton(c *ui.Context, t *ui.Theme, n navItem, compact bool) {
 	on := m.nav == n.id
-	item := ui.Row(c.Key("nav-"+n.id)).Height(36).Padding(0, 12).Gap(14).Radius(4).AlignItems(ui.Center).
+	item := ui.Row(c.Key("nav-"+n.id)).Height(36).Padding(0, 12).Gap(12).Radius(4).AlignItems(ui.Center).
 		Focusable().Role(ui.RoleButton).Label(n.label)
 	switch {
 	case on:
@@ -485,20 +490,22 @@ func (m *model) navButton(c *ui.Context, t *ui.Theme, n navItem, compact bool) {
 		if on {
 			ui.Box(c).Absolute().Left(0).Top(10).Size(3, 16).Radius(1.5).Background(t.Accent)
 		}
-		g := glyph(c, n.glyph)
-		if alert {
-			g.TextColor(t.Warning)
-		}
+		ui.Box(c).Size(20, 20).Shrink(0).Center().Children(func() {
+			g := glyph(c, n.glyph)
+			if alert {
+				g.TextColor(t.Warning)
+			}
+		})
 		switch {
 		case compact:
 		case alert:
 			ui.Text(c, n.label).Grow(1).Shrink(1).SingleLine()
 			ui.Text(c, fmt.Sprint(m.counts[n.id])).FontSize(11).FontWeight(600).SingleLine().
-				Padding(0, 6).MinWidth(18).TextAlign(ui.Center).Radius(9).Background(m.pal.warning)
+				Padding(2, 6).MinWidth(20).TextAlign(ui.Center).Radius(10).Background(m.pal.warning)
 		default:
 			ui.Text(c, n.label).Grow(1).Shrink(1).SingleLine()
 			if !m.loading {
-				ui.Text(c, fmt.Sprint(m.counts[n.id])).FontSize(12).TextColor(t.TextMuted)
+				ui.Text(c, fmt.Sprint(m.counts[n.id])).FontSize(12).FontFeatures("tnum").MinWidth(20).TextAlign(ui.End).TextColor(t.TextMuted)
 			}
 		}
 	})
@@ -511,7 +518,7 @@ func (m *model) adminButton(c *ui.Context, t *ui.Theme, compact bool) {
 	if !m.elevated {
 		label = "Restart as administrator"
 	}
-	item := ui.Row(c.Key("admin")).MinHeight(36).Padding(6, 12).Gap(14).Radius(4).AlignItems(ui.Center).Label(label)
+	item := ui.Row(c.Key("admin")).MinHeight(40).Padding(6, 12).Gap(12).Radius(4).AlignItems(ui.Center).Label(label)
 	if compact {
 		item.Tooltip(label)
 	}
@@ -528,17 +535,19 @@ func (m *model) adminButton(c *ui.Context, t *ui.Theme, compact bool) {
 		}
 	}
 	item.Children(func() {
-		g := glyph(c, glyphShield)
-		if !m.elevated {
-			g.TextColor(t.Warning)
-		}
+		ui.Box(c).Size(20, 20).Shrink(0).Center().Children(func() {
+			g := glyph(c, glyphShield)
+			if !m.elevated {
+				g.TextColor(t.Warning)
+			}
+		})
 		if compact {
 			return
 		}
-		ui.Column(c).Grow(1).Shrink(1).Children(func() {
+		ui.Column(c).Grow(1).Shrink(1).Gap(4).Children(func() {
 			ui.Text(c, label).SingleLine()
 			if !m.elevated {
-				ui.Text(c, "Some apps need it to come off").FontSize(12).TextColor(t.TextMuted).SingleLine()
+				ui.Text(c, "Required for some apps").FontSize(12).TextColor(t.TextMuted).SingleLine()
 			}
 		})
 	})
@@ -549,7 +558,7 @@ func (m *model) adminButton(c *ui.Context, t *ui.Theme, compact bool) {
 // search and Refresh. The view's name is in the navigation pane already.
 func (m *model) commands(c *ui.Context, t *ui.Theme, compact bool) {
 	a := m.selected()
-	ui.Row(c).Padding(8, 16, 8, 16).Gap(12).AlignItems(ui.Center).Shrink(0).Children(func() {
+	ui.Row(c).Padding(8, 16).Gap(12).AlignItems(ui.Center).Shrink(0).Children(func() {
 		ui.Toolbar(c, func() {
 			if a != nil && a.Broken {
 				if command(c, "uninstall", glyphBroom, "Remove leftovers", "Its uninstaller is missing: remove what's left of it (Del)", false) {
@@ -558,7 +567,11 @@ func (m *model) commands(c *ui.Context, t *ui.Theme, compact bool) {
 			} else if command(c, "uninstall", glyphDelete, "Uninstall", "Uninstall (Del)", a == nil) {
 				m.ask(a)
 			}
-			if command(c, "open", glyphOpen, "Open location", "Open the install folder", a == nil || !a.dirExists) {
+			openLabel := "Open location"
+			if compact {
+				openLabel = ""
+			}
+			if command(c, "open", glyphOpen, openLabel, "Open the install folder", a == nil || !a.dirExists) {
 				mygo.Shell.OpenPath(a.Dir)
 			}
 		}).Label("Commands").Grow(1).Shrink(1)
@@ -573,11 +586,11 @@ func (m *model) commands(c *ui.Context, t *ui.Theme, compact bool) {
 			ui.Text(c, summary).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(0)
 		}
 		if ui.SearchField(c.Key("search"), &m.query).Bind(&m.search).Placeholder("Search apps").
-			Label("Search apps").Tooltip("Search by name or publisher (Ctrl+F)").Width(260).Shrink(1).Changed() {
+			Label("Search apps").Tooltip("Search by name or publisher (Ctrl+F)").Width(240).MinWidth(160).Height(controlHeight).Shrink(1).Changed() {
 			m.filter()
 		}
 		ui.Toolbar(c, func() {
-			if ui.Button(c.Key("refresh"), "").Label("Refresh").Tooltip("Refresh (F5)").Padding(6, 8).Disabled(m.loading).
+			if ui.Button(c.Key("refresh"), "").Label("Refresh").Tooltip("Refresh (F5)").Size(controlHeight, controlHeight).Padding(8).Disabled(m.loading).
 				Children(func() { glyph(c, glyphRefresh) }).Clicked() {
 				m.reload()
 			}
@@ -586,9 +599,15 @@ func (m *model) commands(c *ui.Context, t *ui.Theme, compact bool) {
 }
 
 func command(c *ui.Context, key string, g rune, label, tip string, disabled bool) bool {
-	b := ui.Button(c.Key(key), "").Label(label).Gap(8).Padding(6, 10).Disabled(disabled).Children(func() {
+	accessibleLabel := label
+	if accessibleLabel == "" {
+		accessibleLabel = tip
+	}
+	b := ui.Button(c.Key(key), "").Label(accessibleLabel).Height(controlHeight).Gap(8).Padding(6, 8).Disabled(disabled).Children(func() {
 		glyph(c, g)
-		ui.Text(c, label).SingleLine()
+		if label != "" {
+			ui.Text(c, label).FixedLineHeight(18).SingleLine()
+		}
 	})
 	if tip != "" {
 		b.Tooltip(tip)
@@ -598,13 +617,13 @@ func command(c *ui.Context, key string, g rune, label, tip string, disabled bool
 
 func (m *model) appTable(c *ui.Context, t *ui.Theme) {
 	if len(m.shown) == 0 {
-		ui.Column(c).Grow(1).Center().Gap(12).BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke).Children(func() {
+		ui.Column(c).Grow(1).Shrink(1).Padding(contentInset).Center().Gap(16).BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke).Children(func() {
 			switch {
 			case m.loading:
 				ui.Spinner(c).Size(32, 32).Label("Loading")
 			case m.query != "":
 				glyph(c, '').FontSize(32).TextColor(t.TextMuted)
-				ui.Text(c, "No apps match “"+m.query+"”").TextColor(t.TextMuted)
+				ui.Text(c, "No apps match “"+m.query+"”").TextColor(t.TextMuted).TextAlign(ui.Center)
 			default:
 				glyph(c, glyphCompleted).FontSize(32).TextColor(t.TextMuted)
 				ui.Text(c, "Nothing here").TextColor(t.TextMuted)
@@ -636,7 +655,7 @@ func (m *model) appTable(c *ui.Context, t *ui.Theme) {
 	// The chosen row is tinted, as in Explorer, not filled with the accent.
 	c.SetTheme(rowsTheme(t, m.pal))
 	table := ui.Table(c.Key("apps"), &m.list, appColumns, len(m.shown), func(row, col int) { m.cell(c, t, row, col) }).
-		Grow(1).Shrink(1).Label("Installed apps")
+		Grow(1).Shrink(1).Margin(0, tableInset).BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke).Label("Installed apps")
 	m.setTheme(c, t)
 	if table.Changed() { // sorted by another column
 		m.filter()
@@ -656,14 +675,19 @@ func (m *model) appTable(c *ui.Context, t *ui.Theme) {
 
 func (m *model) cell(c *ui.Context, t *ui.Theme, row, col int) {
 	a := m.shown[row]
-	muted := func(s string) { ui.Text(c, s).FontSize(12.5).TextColor(t.TextMuted).SingleLine() }
+	muted := func(s string) { ui.Text(c, s).FontSize(13).TextColor(t.TextMuted).SingleLine().Shrink(1).Tooltip(s) }
 	switch col {
 	case 0:
-		ui.Row(c).Gap(10).AlignItems(ui.Center).Shrink(1).Children(func() {
+		ui.Row(c).MinHeight(28).Gap(12).AlignItems(ui.Center).Shrink(1).Grow(1).Tooltip(a.Name).Children(func() {
 			appIcon(c, t, m.icon(a), iconSize)
 			ui.Text(c, a.Name).SingleLine().Shrink(1)
 			if a.Broken {
-				m.tag(c, t, "Uninstaller missing", m.pal.warning)
+				w, _ := c.Size()
+				if w < 1000 {
+					glyph(c, glyphWarning).TextColor(t.Warning).Tooltip("Uninstaller missing")
+				} else {
+					m.tag(c, t, "Uninstaller missing", m.pal.warning)
+				}
 			}
 		})
 	case 1:
@@ -682,11 +706,11 @@ func (m *model) sizeCell(c *ui.Context, t *ui.Theme, a *App) {
 		return
 	}
 	share := float32(a.SizeKB) / float32(max(m.maxKB, 1))
-	ui.Row(c).Gap(10).AlignItems(ui.Center).Grow(1).Children(func() {
-		ui.Box(c).Width(44).Height(4).Radius(2).Shrink(0).Background(m.pal.tag).Children(func() {
-			ui.Box(c).Width(max(2, 44*share)).Height(4).Radius(2).Background(t.Accent.Alpha(0.35 + 0.65*share))
+	ui.Row(c).Gap(12).AlignItems(ui.Center).Grow(1).Shrink(1).Children(func() {
+		ui.Box(c).Width(36).Height(4).Radius(2).Shrink(0).Background(m.pal.tag).Children(func() {
+			ui.Box(c).Width(max(2, 36*share)).Height(4).Radius(2).Background(t.Accent.Alpha(0.35 + 0.65*share))
 		})
-		ui.Text(c, a.sizeText).FontSize(12.5).FontFeatures("tnum").SingleLine().
+		ui.Text(c, a.sizeText).FontSize(13).FontFeatures("tnum").SingleLine().
 			Grow(1).TextAlign(ui.End)
 	})
 }
@@ -704,7 +728,7 @@ func appIcon(c *ui.Context, t *ui.Theme, b *ui.Bitmap, size float32) {
 
 // tag is a small label of a row, as "Possible match".
 func (m *model) tag(c *ui.Context, t *ui.Theme, label string, bg ui.Color) ui.Element {
-	return ui.Text(c, label).FontSize(11).SingleLine().Padding(1, 6).Radius(4).Background(bg).Shrink(0)
+	return ui.Text(c, label).FontSize(11).FixedLineHeight(14).SingleLine().Padding(2, 6).Radius(4).Background(bg).Shrink(0)
 }
 
 // details tells about the app chosen what its row does not: its version,
@@ -714,37 +738,33 @@ func (m *model) details(c *ui.Context, t *ui.Theme) {
 	if a == nil {
 		return
 	}
-	ui.Row(c).Padding(12, 24).Gap(14).AlignItems(ui.Center).Shrink(0).
+	ui.Row(c).MinHeight(64).Padding(10, contentInset).Gap(16).AlignItems(ui.Center).Shrink(0).
 		BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke).Children(func() {
 		appIcon(c, t, m.icon(a), largeIcon)
-		ui.Column(c).Grow(1).Shrink(1).Gap(3).Children(func() {
-			ui.Row(c).Gap(8).AlignItems(ui.Baseline).Children(func() {
-				ui.Text(c, a.Name).FontWeight(600).SingleLine().Shrink(1)
+		ui.Column(c).Grow(1).Shrink(1).Gap(4).Children(func() {
+			ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+				ui.Text(c, a.Name).FontWeight(600).SingleLine().Shrink(1).Tooltip(a.Name)
 				if a.Version != "" && !strings.Contains(a.Name, a.Version) {
 					ui.Text(c, a.Version).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(0)
 				}
 			})
-			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				facts := "Installed for everyone"
-				if !a.AllUsers {
-					facts = "Installed only for you"
+			facts := "Installed for everyone"
+			if !a.AllUsers {
+				facts = "Installed only for you"
+			}
+			if !a.Broken && a.CanQuiet() {
+				facts += " · Can uninstall quietly"
+			}
+			ui.Text(c, facts).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(1)
+			switch {
+			case a.Broken:
+				ui.Text(c, "Its uninstaller is missing: only its leftovers can be removed").FontSize(12).
+					TextColor(t.Warning).SingleLine().Shrink(1)
+			case a.dirExists:
+				if hyperlink(c, "dir", a.Dir).Tooltip("Open in File Explorer").Shrink(1).Clicked() {
+					mygo.Shell.OpenPath(a.Dir)
 				}
-				if !a.Broken && a.CanQuiet() {
-					facts += " · Can uninstall quietly"
-				}
-				ui.Text(c, facts).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(0)
-				switch {
-				case a.Broken:
-					ui.Text(c, "·").FontSize(12).TextColor(t.TextMuted)
-					ui.Text(c, "Its uninstaller is missing: only its leftovers can be removed").FontSize(12).
-						TextColor(t.Warning).SingleLine().Shrink(1)
-				case a.dirExists:
-					ui.Text(c, "·").FontSize(12).TextColor(t.TextMuted)
-					if hyperlink(c, "dir", a.Dir).Tooltip("Open in File Explorer").Shrink(1).Clicked() {
-						mygo.Shell.OpenPath(a.Dir)
-					}
-				}
-			})
+			}
 		})
 	})
 }
@@ -911,16 +931,16 @@ func (m *model) dialog(c *ui.Context, t *ui.Theme) {
 		return
 	}
 	// Lists of paths take what room the window has; messages are narrow.
-	width := float32(500)
+	width := float32(520)
 	switch {
 	case m.phase == phaseResults && len(m.leftovers) > 0:
-		width = 1040
+		width = 1000
 	case m.phase == phaseReport && len(m.result.Failed) > 0:
 		width = 820
 	}
 	ui.DialogBase(c.Key("dialog"), &m.open, func(backdrop, panel ui.Element) {
 		backdrop.Background(m.pal.smoke)
-		panel.Width(width).MaxWidthPercent(96).MaxHeightPercent(90).Radius(8).Clip().
+		panel.Width(width).MaxWidthPercent(94).MaxHeightPercent(90).Radius(8).Clip().
 			Background(t.Background).Border(1, m.pal.stroke).
 			Shadow(0, 32, 64, 0, ui.RGBA(0, 0, 0, 0.19)).Shadow(0, 2, 21, 0, ui.RGBA(0, 0, 0, 0.15))
 		switch m.phase {
@@ -950,26 +970,28 @@ func (m *model) dialog(c *ui.Context, t *ui.Theme) {
 
 // body holds a dialog's title and content.
 func (m *model) body(c *ui.Context, title string, fn func()) {
-	ui.Column(c).Padding(24).Gap(14).Shrink(1).Children(func() {
-		ui.Text(c, title).Font("Segoe UI Variable Display, Segoe UI").FontSize(20).FontWeight(600)
-		fn()
+	ui.Scroll(c.Key("body")).Shrink(1).Children(func() {
+		ui.Column(c).Padding(20, contentInset).Gap(12).Children(func() {
+			ui.Text(c, title).Font("Segoe UI Variable Display, Segoe UI").FontSize(20).FontWeight(600)
+			fn()
+		})
 	})
 }
 
 // footer is a dialog's band of buttons; in a narrow dialog they share its
 // width, as Windows lays them out.
 func (m *model) footer(c *ui.Context, fn func()) {
-	ui.Row(c).Padding(20, 24).Gap(8).Justify(ui.End).AlignItems(ui.Center).Shrink(0).
+	ui.Row(c).Padding(8, contentInset).Gap(8).Justify(ui.End).AlignItems(ui.Center).Shrink(0).
 		Background(m.pal.footer).BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke).Children(fn)
 }
 
-func wide(b ui.Element) ui.Element { return b.Grow(1).Basis(0).MinWidth(120) }
+func wide(b ui.Element) ui.Element { return b.Grow(1).Basis(0).MinWidth(120).MinHeight(controlHeight) }
 
 func (m *model) appLine(c *ui.Context, t *ui.Theme, a *App) {
 	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
 		appIcon(c, t, m.icon(a), largeIcon)
-		ui.Column(c).Grow(1).Shrink(1).Gap(1).Children(func() {
-			ui.Text(c, a.Name).FontWeight(600).SingleLine()
+		ui.Column(c).Grow(1).Shrink(1).Gap(4).Children(func() {
+			ui.Text(c, a.Name).FontWeight(600).SingleLine().Tooltip(a.Name)
 			if line := byLine(a); line != "" {
 				ui.Text(c, line).FontSize(12).TextColor(t.TextMuted).SingleLine()
 			}
@@ -1145,31 +1167,32 @@ func (m *model) resultsView(c *ui.Context, t *ui.Theme) {
 		return
 	}
 	m.leftoverRows()
-	// The list is what this dialog is for: its title, what was found and
-	// the choice of all or none share one line, the table runs from edge to
-	// edge, and the buttons sit in a slim band under it.
-	ui.Row(c).Padding(14, 20, 12, 20).Gap(12).AlignItems(ui.Baseline).Shrink(0).Children(func() {
-		ui.Text(c, "Leftovers of "+m.target.Name).Font("Segoe UI Variable Display, Segoe UI").
-			FontSize(16).FontWeight(600).SingleLine().Shrink(1)
-		summary := plural(len(items), "item")
-		if size > 0 {
-			summary += " · " + formatBytes(size)
-		}
-		if m.sizing {
-			summary += " · Measuring sizes…"
-		}
-		ui.Text(c, summary).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(0)
-		ui.Box(c).Grow(1)
-		if hyperlink(c, "all", "Select all").Clicked() {
-			for i := range m.leftovers {
-				m.leftovers[i].Selected = true
+	// Keep a stable title area as the summary changes during measurement.
+	ui.Row(c).Height(resultsHeader).Padding(8, contentInset).Gap(16).AlignItems(ui.Center).Shrink(0).Children(func() {
+		ui.Row(c).Grow(1).Shrink(1).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "Leftovers of "+m.target.Name).Font("Segoe UI Variable Display, Segoe UI").
+				FontSize(16).FixedLineHeight(20).FontWeight(600).SingleLine().Shrink(1).Tooltip("Leftovers of " + m.target.Name)
+			summary := plural(len(items), "item")
+			if size > 0 {
+				summary += " · " + formatBytes(size)
 			}
-		}
-		if hyperlink(c, "none", "Select none").Clicked() {
-			for i := range m.leftovers {
-				m.leftovers[i].Selected = false
+			if m.sizing {
+				summary += " · Measuring sizes…"
 			}
-		}
+			ui.Text(c, summary).FontSize(12).FixedLineHeight(16).TextColor(t.TextMuted).SingleLine().Shrink(0)
+		})
+		ui.Toolbar(c, func() {
+			if ui.Button(c.Key("all"), "Select all").Height(controlHeight).Padding(6, 10).Clicked() {
+				for i := range m.leftovers {
+					m.leftovers[i].Selected = true
+				}
+			}
+			if ui.Button(c.Key("none"), "Select none").Height(controlHeight).Padding(6, 10).Clicked() {
+				for i := range m.leftovers {
+					m.leftovers[i].Selected = false
+				}
+			}
+		}).Label("Selection").Shrink(0)
 	})
 	m.rowList.Key = func(i int) any {
 		if r := m.rows[i]; r >= 0 {
@@ -1186,48 +1209,67 @@ func (m *model) resultsView(c *ui.Context, t *ui.Theme) {
 	}
 	// The table shows its rows whole, as far as the window has room for
 	// them with the title and the buttons.
-	_, h := c.Size()
-	room := max(160, h*0.9-110)
+	w, h := c.Size()
+	stacked := w < 840
+	footerHeight := float32(48)
+	if stacked {
+		footerHeight = 72
+	}
+	room := max(80, h*0.9-resultsHeader-footerHeight-2)
 	ui.Table(c.Key("leftovers"), &m.rowList, leftoverColumns, len(m.rows), func(row, col int) { m.leftoverCell(c, t, row, col) }).
-		Height(min(room, m.leftoversHeight())).Shrink(1).BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke).Label("Leftovers")
-	ui.Row(c).Padding(10, 16, 10, 20).Gap(8).AlignItems(ui.Center).Shrink(0).
-		Background(m.pal.footer).BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke).Children(func() {
-		// That nothing is lost for good is what makes removing safe: it is
-		// said beside the button that does it.
+		Height(m.leftoversHeight(room)).Shrink(1).Margin(0, tableInset).BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke).Label("Leftovers")
+	note := func() {
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Grow(1).Shrink(1).Children(func() {
 			glyph(c, glyphInfo).FontSize(14).TextColor(t.TextMuted)
 			ui.Text(c, "Files go to the Recycle Bin. Registry entries are backed up first.").
-				FontSize(12).TextColor(t.TextMuted).Shrink(1)
+				FontSize(12).FixedLineHeight(16).TextColor(t.TextMuted).Shrink(1)
 		})
-		label := "Remove " + plural(chosen, "item")
-		if chosenSize > 0 {
-			label += " (" + formatBytes(chosenSize) + ")"
+	}
+	ui.Column(c).Padding(8, contentInset).Gap(8).Shrink(0).
+		Background(m.pal.footer).BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke).Children(func() {
+		if stacked {
+			note()
 		}
-		if ui.PrimaryButton(c.Key("remove"), label).MinWidth(160).Disabled(chosen == 0 || m.sizing).Clicked() {
-			var picked []Leftover
-			for _, l := range m.leftovers {
-				if l.Selected {
-					picked = append(picked, l)
-				}
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Justify(ui.End).Children(func() {
+			if !stacked {
+				note()
 			}
-			m.clean(picked, false)
-		}
-		if ui.Button(c.Key("skip"), "Skip").MinWidth(100).Clicked() {
-			m.close()
-		}
+			label := "Remove " + plural(chosen, "item")
+			if chosenSize > 0 {
+				label += " (" + formatBytes(chosenSize) + ")"
+			}
+			if ui.PrimaryButton(c.Key("remove"), label).MinWidth(180).Height(controlHeight).Disabled(chosen == 0 || m.sizing).Clicked() {
+				var picked []Leftover
+				for _, l := range m.leftovers {
+					if l.Selected {
+						picked = append(picked, l)
+					}
+				}
+				m.clean(picked, false)
+			}
+			if ui.Button(c.Key("skip"), "Skip").MinWidth(96).Height(controlHeight).Clicked() {
+				m.close()
+			}
+		})
 	})
 }
 
-// leftoversHeight is the height the leftovers table takes to show all its
-// rows, under its header.
-func (m *model) leftoversHeight() float32 {
-	h := float32(headerRow + 2)
+// leftoversHeight fits whole rows on first opening; scrolling still reaches
+// every item. Do not leave a section header without its first item.
+func (m *model) leftoversHeight(room float32) float32 {
+	h := float32(tableHeader + 2)
 	for _, r := range m.rows {
+		next := float32(leftoverRow)
 		if r < 0 {
-			h += headerRow
-		} else {
-			h += leftoverRow
+			next = headerRow
+			if h+next+leftoverRow > room {
+				break
+			}
 		}
+		if h+next > room {
+			break
+		}
+		h += next
 	}
 	return h
 }
@@ -1243,10 +1285,10 @@ func (m *model) leftoverCell(c *ui.Context, t *ui.Theme, row, col int) {
 		if r == rowRegistry {
 			n = m.registryCount
 		}
-		ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
-			glyph(c, g).FontSize(14)
-			ui.Text(c, title).FontSize(12.5)
-			ui.Text(c, fmt.Sprint(n)).FontSize(12).FontWeight(400).TextColor(t.TextMuted)
+		ui.Row(c).MinHeight(headerRow - 12).Gap(12).AlignItems(ui.Center).Children(func() {
+			ui.Box(c).Size(20, 20).Shrink(0).Center().Children(func() { glyph(c, g).FontSize(14) })
+			ui.Text(c, title).FontSize(12.5).FixedLineHeight(18)
+			ui.Text(c, fmt.Sprint(n)).FontSize(12).FixedLineHeight(16).FontWeight(400).TextColor(t.TextMuted)
 		})
 		return
 	}
@@ -1266,11 +1308,11 @@ func (m *model) leftoverCell(c *ui.Context, t *ui.Theme, row, col int) {
 		}
 		name, parent := shortPath(l)
 		why, doubt := splitReason(l.Reason)
-		ui.Row(c).Gap(12).AlignItems(ui.Center).Shrink(1).Grow(1).Tooltip(l.Display() + "\n" + l.Reason).Children(func() {
-			glyph(c, g).FontSize(18).TextColor(t.TextMuted)
-			ui.Column(c).Gap(2).Grow(1).Shrink(1).Children(func() {
+		ui.Row(c).MinHeight(leftoverRow - 12).Gap(12).AlignItems(ui.Center).Shrink(1).Grow(1).Tooltip(l.Display() + "\n" + l.Reason).Children(func() {
+			ui.Box(c).Size(20, 20).Shrink(0).Center().Children(func() { glyph(c, g).FontSize(18).TextColor(t.TextMuted) })
+			ui.Column(c).Gap(4).Grow(1).Shrink(1).Children(func() {
 				ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, name).SingleLine().Shrink(1)
+					ui.Text(c, name).FixedLineHeight(18).SingleLine().Shrink(1)
 					switch {
 					case doubt != "":
 						m.tag(c, t, doubt, m.pal.warning).Label("Possible match: " + doubt)
@@ -1278,17 +1320,11 @@ func (m *model) leftoverCell(c *ui.Context, t *ui.Theme, row, col int) {
 						m.tag(c, t, "Possible match", m.pal.warning)
 					}
 				})
-				// Why it was found is short, and stays whole; where it is
-				// gives way at its end, the whole of it in the tooltip.
-				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, why).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(0)
-					ui.Text(c, "·").FontSize(12).TextColor(t.TextMuted).Shrink(0)
-					ui.Text(c, parent).FontSize(12).TextColor(t.TextMuted).SingleLine().Shrink(1)
-				})
+				ui.Text(c, why+" · "+parent).FontSize(12).FixedLineHeight(14).TextColor(t.TextMuted).SingleLine().Tooltip(l.Display() + "\n" + l.Reason)
 			})
 		})
 	case 2:
-		ui.Text(c, formatBytes(l.Size)).FontSize(12.5).FontFeatures("tnum")
+		ui.Text(c, formatBytes(l.Size)).FontSize(13).FontFeatures("tnum").SingleLine()
 	}
 }
 
@@ -1333,13 +1369,13 @@ func (m *model) reportView(c *ui.Context, t *ui.Theme) {
 				if !f.Item.IsRegistry() {
 					files = append(files, f.Item)
 				}
-				row := ui.Row(c).Padding(8, 12).Gap(10)
+				row := ui.Row(c).Padding(12, 16).Gap(12).AlignItems(ui.Start)
 				if i > 0 {
 					row.BorderWidth(1, 0, 0, 0).BorderColor(m.pal.stroke)
 				}
 				row.Children(func() {
-					glyph(c, glyphError).FontSize(14).TextColor(t.Danger).Margin(2, 0, 0, 0)
-					ui.Column(c).Grow(1).Shrink(1).Gap(2).Children(func() {
+					ui.Box(c).Size(16, 20).Shrink(0).Center().Children(func() { glyph(c, glyphError).FontSize(14).TextColor(t.Danger) })
+					ui.Column(c).Grow(1).Shrink(1).Gap(4).Children(func() {
 						ui.Text(c, f.Item.Display()).FontSize(12.5)
 						ui.Text(c, f.Err.Error()).FontSize(12).TextColor(t.TextMuted)
 					})
@@ -1349,7 +1385,7 @@ func (m *model) reportView(c *ui.Context, t *ui.Theme) {
 	})
 	m.footer(c, func() {
 		narrow := len(r.Failed) == 0
-		done := ui.PrimaryButton(c.Key("done"), "Done").AutoFocus()
+		done := ui.PrimaryButton(c.Key("done"), "Done").MinHeight(controlHeight).AutoFocus()
 		if narrow {
 			wide(done)
 		} else {
@@ -1359,7 +1395,7 @@ func (m *model) reportView(c *ui.Context, t *ui.Theme) {
 			m.close()
 		}
 		if len(files) > 0 && ui.Button(c.Key("permanent"), "Delete them permanently").
-			Tooltip("Skips the Recycle Bin: they can't be put back").Clicked() {
+			MinHeight(controlHeight).Tooltip("Skips the Recycle Bin: they can't be put back").Clicked() {
 			m.clean(files, true)
 		}
 	})
@@ -1386,9 +1422,9 @@ func (m *model) infoBar(c *ui.Context, t *ui.Theme, kind infoKind, title, msg st
 	case infoError:
 		bg, color, g = m.pal.errBg, t.Danger, glyphError
 	}
-	ui.Row(c).Padding(12, 14).Gap(12).Radius(4).Background(bg).Border(1, m.pal.stroke).AlignItems(ui.Center).Children(func() {
-		glyph(c, g).TextColor(color)
-		ui.Column(c).Grow(1).Shrink(1).Gap(2).Children(func() {
+	ui.Row(c).Padding(12, 16).Gap(12).Radius(4).Background(bg).Border(1, m.pal.stroke).AlignItems(ui.Start).Children(func() {
+		ui.Box(c).Size(16, 20).Shrink(0).Center().Children(func() { glyph(c, g).TextColor(color) })
+		ui.Column(c).Grow(1).Shrink(1).Gap(4).Children(func() {
 			if title != "" {
 				ui.Text(c, title).FontWeight(600)
 			}

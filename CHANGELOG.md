@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.2 — 2026-10-31
+
+- Polish spacing and alignment across the app list, navigation, details and dialogs.
+- Compact the leftovers header and footer, keeping more room for the items being reviewed.
+- Improve narrow-window layouts, long-text handling and scrolling without clipped rows.
+- Improve startup, app loading and background leftover scanning, with bounded icon caching.
+- Refresh the README screenshots and add layout regression coverage for both themes.
+
 ## 0.0.1 — 2026-10-31
 
 First public release.

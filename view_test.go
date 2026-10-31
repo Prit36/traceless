@@ -106,12 +106,18 @@ func TestViewFlow(t *testing.T) {
 	for i := range m.leftovers {
 		m.leftovers[i].Selected = m.leftovers[i].Sure
 	}
+	results := slices.Clone(m.leftovers)
 	m.phase = phaseResults
 	tt.Frame()
 	if !tt.HasText("Leftovers of VLC media player") || !tt.HasText("May hold your own files") || !tt.HasText("Run") {
 		t.Fatalf("results: %q", tt.Texts())
 	}
 	snapshot(t, tt, "5-results")
+	last, ok := tt.Find(`Starts with Windows · HKCU\Software\Microsoft\Windows\CurrentVersion\Run`)
+	remove, _ := tt.Find("Remove 7 items (45.7 MB)")
+	if !ok || last.Y+last.H > remove.Y-8 {
+		t.Fatal("the last leftover is clipped at the default window size")
+	}
 	tt.SetSize(920, 660)
 	tt.Frame()
 	snapshot(t, tt, "5b-results-small")
@@ -162,6 +168,7 @@ func TestViewFlow(t *testing.T) {
 	tt.Frame()
 	snapshot(t, tt, "9-dark")
 	m.phase = phaseResults
+	m.target, m.leftovers = m.apps[3], results
 	tt.Frame()
 	snapshot(t, tt, "10-dark-results")
 
