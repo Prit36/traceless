@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.4 — 2026-10-31
+
+- Group leftovers into expandable Files and folders and Registry sections,
+  with selection and size totals for each group.
+- Search leftovers by name, full path or reason, and filter to possible matches.
+- Keep the results header and footer on one row, with bulk actions in Options
+  and compact Remove and Skip buttons.
+- Show selection counts, sizes and hidden selections clearly while filtering.
+  Bulk selection applies to all matching results, including off-screen items.
+- Fix keyboard scrolling and collapsing sections with ungrouped entries.
+- Cache visible tree rows and use stable item identities for large result lists,
+  with regression coverage through 50,000 entries.
+
 ## 0.0.3 — 2026-10-31
 
 - Find more of what apps leave behind: XDG folders in your home (`.config`, `.cache`,

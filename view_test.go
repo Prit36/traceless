@@ -124,7 +124,7 @@ func TestViewFlow(t *testing.T) {
 	snapshot(t, tt, "5b-results-small")
 	tt.SetSize(1060, 700)
 	tt.Frame()
-	if err := tt.Click("Select none"); err != nil {
+	if err := leftoverAction(tt, "Select none"); err != nil {
 		t.Fatal(err)
 	}
 	for _, l := range m.leftovers {
@@ -132,7 +132,7 @@ func TestViewFlow(t *testing.T) {
 			t.Fatal("Select none left one chosen")
 		}
 	}
-	tt.Click("Select all")
+	leftoverAction(tt, "Select all")
 
 	// A section's box chooses the whole section, and only it; a mixed box
 	// chooses all of its section.
@@ -162,7 +162,7 @@ func TestViewFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	section(false, true)
-	tt.Click("Select all")
+	leftoverAction(tt, "Select all")
 
 	// What removing them did.
 	m.result = CleanResult{Removed: 6, Freed: 942 << 20, BackupDir: `C:\Users\Ada\AppData\Local\Uninstaller\Registry backups\VLC`,
@@ -267,10 +267,10 @@ func TestLeftoverSectionsFold(t *testing.T) {
 	if tt.HasText("vlc") {
 		t.Fatal("files not folded")
 	}
-	if err := tt.Click("Expand all"); err != nil {
+	if err := leftoverAction(tt, "Expand all"); err != nil {
 		t.Fatal(err)
 	}
-	if !tt.HasText("vlc") || !tt.HasText("setting 9") || !tt.HasText("Collapse all") {
+	if !tt.HasText("vlc") || !tt.HasText("setting 9") || m.folded["files"] || m.folded["registry/Setting"] {
 		t.Fatal("Expand all left a row folded")
 	}
 }

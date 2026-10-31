@@ -38,17 +38,22 @@ func TestViewLayoutBoundaries(t *testing.T) {
 				m.leftovers = layoutLeftovers()
 				m.phase = phaseResults
 				tt.Frame()
-				all := visibleBox(t, tt, "Select all", size)
-				none := visibleBox(t, tt, "Select none", size)
+				options := visibleBox(t, tt, "Leftover options", size)
+				search = visibleBox(t, tt, "Search leftovers", size)
 				skip := visibleBox(t, tt, "Skip", size)
 				remove := visibleBox(t, tt, "Remove 2 items (1.0 MB)", size)
-				if all.X+all.W > none.X || remove.X+remove.W > skip.X || all.Y+all.H >= remove.Y {
+				note := visibleBox(t, tt, "Files go to the Recycle Bin. Registry entries are backed up first.", size)
+				if search.X+search.W > options.X || remove.X+remove.W > skip.X || options.Y+options.H >= remove.Y {
 					t.Fatal("dialog actions overlap")
+				}
+				if note.Y+note.H/2 < remove.Y+remove.H/2-4 || note.Y+note.H/2 > remove.Y+remove.H/2+4 || note.H > 18 || note.X+note.W > remove.X-8 {
+					t.Fatalf("footer is not one row: note=%+v remove=%+v", note, remove)
 				}
 				// Header and footer stay compact, and no initial row is cut off.
 				list := visibleBox(t, tt, "Leftovers", size)
-				if list.Y-(all.Y+all.H) > 16 || remove.H > controlHeight+1 {
-					t.Fatalf("header or footer has excessive vertical space: list=%+v all=%+v remove=%+v", list, all, remove)
+				filter := visibleBox(t, tt, "Search leftovers", size)
+				if filter.Y < options.Y-8 || filter.Y > options.Y+8 || list.Y-(filter.Y+filter.H) > 16 || remove.H > controlHeight+1 {
+					t.Fatalf("header is not one compact row: list=%+v search=%+v options=%+v remove=%+v", list, filter, options, remove)
 				}
 				for _, l := range m.leftovers {
 					name, parent := shortPath(&l)
@@ -59,7 +64,7 @@ func TestViewLayoutBoundaries(t *testing.T) {
 						}
 					}
 				}
-				if err := tt.Click("Select none"); err != nil {
+				if err := leftoverAction(tt, "Select none"); err != nil {
 					t.Fatal(err)
 				}
 				for _, l := range m.leftovers {
@@ -67,7 +72,7 @@ func TestViewLayoutBoundaries(t *testing.T) {
 						t.Fatal("Select none missed an item")
 					}
 				}
-				if err := tt.Click("Select all"); err != nil {
+				if err := leftoverAction(tt, "Select all"); err != nil {
 					t.Fatal(err)
 				}
 				for _, l := range m.leftovers {
@@ -81,7 +86,7 @@ func TestViewLayoutBoundaries(t *testing.T) {
 				tt.Scroll(list.X+list.W/2, list.Y+list.H/2, 0, 10000)
 				last := visibleBox(t, tt, "Final registry entry", size)
 				remove = visibleBox(t, tt, "Remove 4 items (2.0 MB)", size)
-				if last.Y+last.H > remove.Y-16 {
+				if last.Y+last.H > remove.Y-8 {
 					t.Fatal("last row is obscured by the footer")
 				}
 				snapshot(t, tt, fmt.Sprintf("layout-%dx%d-dark-%v", size[0], size[1], dark))
