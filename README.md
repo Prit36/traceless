@@ -60,7 +60,7 @@ everyone need. Decline and it runs as is; the side pane offers to restart as adm
 
 ## Build from source
 
-Requires [Go](https://go.dev/dl/) 1.27+ on Windows. Traceless is built with
+Requires [Go](https://go.dev/dl/) 1.27.4+ on Windows. Traceless is built with
 [MyGo](https://github.com/egoist/mygo)'s native UI, drawn on the GPU.
 
 ```sh
@@ -68,6 +68,11 @@ go tool mygo dev      # run with live reload (set TRACELESS_NO_ELEVATE=1 to skip
 go test ./...         # scanner, cleanup and UI-flow tests (headless)
 go tool mygo build    # build/windows-amd64: Traceless.exe and an installer
 ```
+
+Scan matches appear before folder sizes finish. Scans can be dismissed while
+sizes are measured; background walks are canceled, and icon loading runs outside
+the UI thread with a bounded cache. See [performance measurements](docs/performance.md)
+for benchmarks, memory usage, and validation limits.
 
 ## License
 

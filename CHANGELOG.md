@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.5 — 2026-11-16
+
+- Use Go 1.27.4, MyGo 0.9.2 and updated runtime and packaging dependencies.
+- Bundle third-party notices with packaged builds.
+- Include scanner and leftover performance documentation and benchmarks.
+
 ## 0.0.4 — 2026-10-31
 
 - Group leftovers into expandable Files and folders and Registry sections,
